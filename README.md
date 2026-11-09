@@ -40,3 +40,10 @@ A table scores each model walk-forward over the last N bars (accuracy, Brier sco
 
 Install: TradingView → **Pine Editor** → paste the file → **Add to chart**.
 Alerts: "Next candle likely UP / DOWN" (fire on closed bars only).
+
+## TradingView: Multi-Timeframe Candle Probability (`tradingview/mtf_candle_probability.pine`)
+
+Naive Bayes model run separately on 1 min, 5 min and 1 day candles (via `request.security`).
+Shows P(current candle closes up) per timeframe, a walk-forward accuracy score and the edge
+over always guessing the more common color. Background turns green/red when all three agree.
+Use it on a 1-minute chart. Prediction is fixed at the previous candle's close (no repainting).

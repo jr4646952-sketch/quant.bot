@@ -1,0 +1,121 @@
+//@version=6
+// Multi-Timeframe Candle Probability (Naive Bayes)
+// Probability that the CURRENT candle on 1 min, 5 min and 1 day closes UP (above the previous close).
+// Each timeframe runs its own Naive Bayes model, learned walk-forward from that timeframe's candles:
+//   P(up | x) ~ P(up) * P(rsi zone | up) * P(close-in-range zone | up) * P(trend | up)
+//               * P(last 2 colors | up) * P(volume high/low | up)
+// Counts fade slowly (memory setting) so the model adapts to new market conditions.
+// The prediction for a candle is fixed when the previous candle closes (no repainting).
+// Best on a 1-minute chart. Research tool, not financial advice.
+indicator("Multi-Timeframe Candle Probability", shorttitle = "MTF-P", overlay = false)
+
+tfA     = input.timeframe("1", "Timeframe A")
+tfB     = input.timeframe("5", "Timeframe B")
+tfC     = input.timeframe("D", "Timeframe C")
+decay   = input.float(0.997, "Memory (count decay per candle)", minval = 0.9, maxval = 1.0, step = 0.001)
+evalLen = input.int(200, "Score window (candles)", minval = 20)
+upTh    = input.float(58, "Bullish threshold %", minval = 50, maxval = 100)
+dnTh    = input.float(42, "Bearish threshold %", minval = 0, maxval = 50)
+
+// Naive Bayes on 5 bucketed features. Returns the values fixed at the last closed candle:
+// [P(up) for the candle now forming, past accuracy, share of up candles]
+nbModel(float dec, int len) =>
+    int y = close > close[1] ? 1 : 0
+    float r = ta.rsi(close, 14)
+    int b1 = na(r) ? 1 : r < 40 ? 0 : r > 60 ? 2 : 1                       // RSI zone (3)
+    float clv = high > low ? (2 * close - high - low) / (high - low) : 0.0
+    int b2 = clv < -0.33 ? 0 : clv > 0.33 ? 2 : 1                            // close in range (3)
+    int b3 = close > nz(ta.ema(close, 50), close) ? 1 : 0                    // trend (2)
+    int b4 = 2 * nz(y[1]) + y                                                // last 2 colors (4)
+    int b5 = nz(volume) > nz(ta.sma(nz(volume), 20)) ? 1 : 0                 // volume (2)
+    // slots per class: RSI 0-2, CLV 3-5, trend 6-7, colors 8-11, volume 12-13
+    var array<float> cls = array.new<float>(2, 0.0)
+    var array<float> cnt = array.new<float>(28, 0.0)
+    sizes = array.from(3.0, 3.0, 2.0, 4.0, 2.0)
+    prevIdx = array.from(nz(b1[1], 1), 3 + nz(b2[1], 1), 6 + nz(b3[1], 0), 8 + nz(b4[1], 0), 12 + nz(b5[1], 0))
+    // learn: features of the previous candle -> did this candle close up?
+    if bar_index > 2
+        for i = 0 to 1
+            cls.set(i, cls.get(i) * dec)
+        for i = 0 to 27
+            cnt.set(i, cnt.get(i) * dec)
+        cls.set(y, cls.get(y) + 1.0)
+        for i = 0 to 4
+            k = y * 14 + prevIdx.get(i)
+            cnt.set(k, cnt.get(k) + 1.0)
+    // predict the next candle from this candle's features
+    nowIdx = array.from(b1, 3 + b2, 6 + b3, 8 + b4, 12 + b5)
+    n0 = cls.get(0)
+    n1 = cls.get(1)
+    float lp0 = math.log((n0 + 1.0) / (n0 + n1 + 2.0))
+    float lp1 = math.log((n1 + 1.0) / (n0 + n1 + 2.0))
+    for i = 0 to 4
+        j = nowIdx.get(i)
+        lp0 += math.log((cnt.get(j) + 1.0) / (n0 + sizes.get(i)))
+        lp1 += math.log((cnt.get(14 + j) + 1.0) / (n1 + sizes.get(i)))
+    float p = 1.0 / (1.0 + math.exp(math.max(-30.0, math.min(30.0, lp0 - lp1))))
+    // walk-forward score of past predictions
+    pp = nz(p[1], 0.5)
+    hit = (pp >= 0.5) == (y == 1) ? 1.0 : 0.0
+    acc = ta.sma(hit, len)
+    upShare = ta.sma(float(y), len)
+    [p[1], acc[1], upShare[1]]
+
+[pA, accA, upA] = request.security(syminfo.tickerid, tfA, nbModel(decay, evalLen), lookahead = barmerge.lookahead_on)
+[pB, accB, upB] = request.security(syminfo.tickerid, tfB, nbModel(decay, evalLen), lookahead = barmerge.lookahead_on)
+[pC, accC, upC] = request.security(syminfo.tickerid, tfC, nbModel(decay, evalLen), lookahead = barmerge.lookahead_on)
+
+chartSec = timeframe.in_seconds(timeframe.period)
+okA = timeframe.in_seconds(tfA) >= chartSec
+okB = timeframe.in_seconds(tfB) >= chartSec
+okC = timeframe.in_seconds(tfC) >= chartSec
+
+// ---------------------------------------------------------------- plots
+plot(okA ? pA * 100 : na, "P(up) A", color = color.aqua, linewidth = 1)
+plot(okB ? pB * 100 : na, "P(up) B", color = color.orange, linewidth = 2)
+plot(okC ? pC * 100 : na, "P(up) C", color = color.fuchsia, linewidth = 3)
+hline(50, "50%", color = color.gray, linestyle = hline.style_dotted)
+hline(upTh, "Bullish", color = color.new(color.teal, 50))
+hline(dnTh, "Bearish", color = color.new(color.red, 50))
+
+allUp = okA and okB and okC and pA * 100 >= upTh and pB * 100 >= upTh and pC * 100 >= upTh
+allDn = okA and okB and okC and pA * 100 <= dnTh and pB * 100 <= dnTh and pC * 100 <= dnTh
+bgcolor(allUp ? color.new(color.teal, 85) : allDn ? color.new(color.red, 85) : na)
+alertcondition(allUp and not allUp[1], "All timeframes UP", "MTF-P: all timeframes above the bullish threshold")
+alertcondition(allDn and not allDn[1], "All timeframes DOWN", "MTF-P: all timeframes below the bearish threshold")
+bUp = ta.crossover(pB * 100, upTh)
+bDn = ta.crossunder(pB * 100, dnTh)
+alertcondition(okB and bUp, "Timeframe B UP", "MTF-P: timeframe B crossed above the bullish threshold")
+alertcondition(okB and bDn, "Timeframe B DOWN", "MTF-P: timeframe B crossed below the bearish threshold")
+
+// ---------------------------------------------------------------- table
+tfName(string tf) =>
+    s = timeframe.in_seconds(tf)
+    s < 3600 ? str.tostring(s / 60) + " min" : s < 86400 ? str.tostring(s / 3600) + " hour" : s == 86400 ? "1 day" : tf
+
+var table t = table.new(position.top_right, 6, 4, border_width = 1, bgcolor = color.new(color.black, 20))
+cell(c, r, txt, col) => table.cell(t, c, r, txt, text_color = col, text_size = size.small)
+
+row(r, string tf, bool ok, float p, float acc, float up) =>
+    cell(0, r, tfName(tf), color.white)
+    if not ok
+        cell(1, r, "use a " + tfName(tf) + " or lower chart", color.gray)
+        for c = 2 to 5
+            cell(c, r, "", color.gray)
+    else
+        sig = p * 100 >= upTh ? "UP" : p * 100 <= dnTh ? "DOWN" : "no edge"
+        col = p * 100 >= upTh ? color.teal : p * 100 <= dnTh ? color.red : color.gray
+        edge = acc - math.max(up, 1 - up)        // vs. always guessing the more common color
+        cell(1, r, str.tostring(p * 100, "0.0") + "%", col)
+        cell(2, r, str.tostring((1 - p) * 100, "0.0") + "%", color.white)
+        cell(3, r, sig, col)
+        cell(4, r, na(acc) ? "warming up" : str.tostring(acc * 100, "0.0") + "%", color.white)
+        cell(5, r, na(edge) ? "-" : str.tostring(edge * 100, "+0.0;-0.0") + " pts", edge > 0 ? color.teal : color.red)
+
+if barstate.islast
+    hdr = array.from("Timeframe", "P(up)", "P(down)", "Signal", "Accuracy", "Edge")
+    for c = 0 to 5
+        cell(c, 0, hdr.get(c), color.yellow)
+    row(1, tfA, okA, pA, accA, upA)
+    row(2, tfB, okB, pB, accB, upB)
+    row(3, tfC, okC, pC, accC, upC)
