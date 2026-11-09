@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Live Quant Tracker</title>
+<style>
+:root{
+  --bg:#f5f6f8;--card:#ffffff;--ink:#14171c;--muted:#5f6773;--line:#e3e6eb;
+  --up:#0a8a4a;--down:#c92a2a;--warn:#b35c00;--accent:#2f5bea;--track:#e8ebf0;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1115;--card:#171a21;--ink:#e8eaee;--muted:#9aa3b0;--line:#262b35;
+    --up:#3ccf86;--down:#ff6b6b;--warn:#ffb454;--accent:#7c9cff;--track:#232833;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1115;--card:#171a21;--ink:#e8eaee;--muted:#9aa3b0;--line:#262b35;
+  --up:#3ccf86;--down:#ff6b6b;--warn:#ffb454;--accent:#7c9cff;--track:#232833;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  padding:12px 16px calc(24px + env(safe-area-inset-bottom))}
+main{max-width:720px;margin:0 auto;display:grid;gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+h1{font-size:18px;margin:0}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 10px;font-weight:600}
+.row{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.muted{color:var(--muted)}.small{font-size:13px}
+.up{color:var(--up)}.down{color:var(--down)}.warn{color:var(--warn)}
+.big{font-size:44px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.num{font-variant-numeric:tabular-nums}
+.pill{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px;font-weight:600;border:1px solid currentColor}
+.gauge{position:relative;height:12px;border-radius:6px;background:var(--track);margin:12px 0 4px;overflow:hidden}
+.gauge .mid{position:absolute;left:50%;top:0;bottom:0;width:2px;background:var(--muted);opacity:.6}
+.gauge .fill{position:absolute;top:0;bottom:0}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.stat{background:var(--bg);border-radius:10px;padding:8px 10px}
+.stat b{display:block;font-size:18px;font-variant-numeric:tabular-nums}
+.stat span{font-size:12px;color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:5px 4px;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--muted);font-weight:600}
+ul.news{list-style:none;margin:0;padding:0}
+ul.news li{padding:8px 0;border-bottom:1px solid var(--line);font-size:14px}
+ul.news a{color:var(--ink);text-decoration:none}
+.tag{font-size:11px;font-weight:700;margin-right:6px}
+input{width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font-size:14px}
+button{padding:10px 14px;border-radius:10px;border:0;background:var(--accent);color:#fff;font-weight:600;font-size:14px}
+.flex{display:flex;gap:8px;margin-top:8px}
+.note{font-size:12px;color:var(--muted)}
+svg{display:block;width:100%;height:90px}
+.reason{display:flex;justify-content:space-between;font-size:13px;padding:3px 0}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+  <div class="row">
+    <h1>Live Quant Tracker</h1>
+    <span id="status" class="pill muted">loading…</span>
+  </div>
+
+  <section class="card" id="priceCard">
+    <div class="row">
+      <div><div class="muted small" id="sym">—</div><div class="num" style="font-size:26px;font-weight:700" id="price">—</div></div>
+      <div style="text-align:right" class="small muted"><div id="barTime">—</div><div id="dataAge">—</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Chance the next bar closes higher</h2>
+    <div class="row"><div class="big" id="pUp">—</div><div style="text-align:right"><div id="signal" class="pill">—</div></div></div>
+    <div class="gauge"><div class="fill" id="gFill"></div><div class="mid"></div></div>
+    <div class="row small muted"><span>0% (down)</span><span>50% = coin flip</span><span>100% (up)</span></div>
+    <p class="small" style="margin:10px 0 4px">With news: <b id="pNews" class="num">—</b> <span class="muted">(news mood <span id="newsScore">—</span>, graded live below)</span></p>
+    <div id="reasons" style="margin-top:8px"></div>
+  </section>
+
+  <section class="card">
+    <h2>Honest test (data the model never saw)</h2>
+    <div class="grid">
+      <div class="stat"><b id="tAcc">—</b><span>accuracy (50% = guessing)</span></div>
+      <div class="stat"><b id="tSkill">—</b><span>skill vs. no-skill guess</span></div>
+      <div class="stat"><b id="tPnl">—</b><span>test P&amp;L after fees</span></div>
+      <div class="stat"><b id="tEdge">—</b><span>allowed to trade?</span></div>
+    </div>
+    <p class="note" id="tInfo"></p>
+  </section>
+
+  <section class="card">
+    <h2>Live track record (since bot started)</h2>
+    <div class="grid">
+      <div class="stat"><b id="lN">—</b><span>predictions graded</span></div>
+      <div class="stat"><b id="lAcc">—</b><span>accuracy</span></div>
+      <div class="stat"><b id="lSkill">—</b><span>model skill</span></div>
+      <div class="stat"><b id="lNews">—</b><span>model + news skill</span></div>
+    </div>
+    <p class="note">Skill above 0% means the probabilities beat a simple base-rate guess. Calibration: when the bot says ~60%, price should rise ~60% of the time.</p>
+    <table><thead><tr><th>Said</th><th>Times</th><th>Avg said</th><th>Really went up</th></tr></thead><tbody id="calib"></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>Paper account (1 contract)</h2>
+    <div class="grid">
+      <div class="stat"><b id="aEq">—</b><span>equity</span></div>
+      <div class="stat"><b id="aPnl">—</b><span>net P&amp;L</span></div>
+      <div class="stat"><b id="aWin">—</b><span>win rate</span></div>
+      <div class="stat"><b id="aDd">—</b><span>max drawdown</span></div>
+    </div>
+    <p class="small" id="pos" style="margin:10px 0"></p>
+    <svg id="curve" viewBox="0 0 300 90" preserveAspectRatio="none" role="img" aria-label="Equity curve"></svg>
+    <table style="margin-top:8px"><thead><tr><th>Exit</th><th>Side</th><th>Why</th><th>P&amp;L</th></tr></thead><tbody id="trades"></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>NASDAQ news</h2>
+    <p class="small muted" id="newsSum" style="margin-top:0"></p>
+    <ul class="news" id="news"></ul>
+  </section>
+
+  <section class="card">
+    <h2>Bot data source</h2>
+    <input id="src" placeholder="https://raw.githubusercontent.com/YOU/REPO/main/state/bot.json" autocomplete="off">
+    <div class="flex"><button id="go">Connect</button><button id="ref" style="background:var(--muted)">Refresh</button></div>
+    <p class="note" id="updated"></p>
+    <p class="note">Paper money only. Not financial advice. Free Yahoo prices for futures run about 10 minutes late, and news is usually priced in before it reaches an RSS feed. 1 MNQ point = $2.</p>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const pct = (x, d = 1) => x == null ? '—' : (x * 100).toFixed(d) + '%';
+const usd = x => x == null ? '—' : (x < 0 ? '-$' : '$') + Math.abs(x).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const tm = t => t ? new Date(t * 1000).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : '—';
+const cls = (el, x) => { el.classList.remove('up', 'down'); if (x > 0) el.classList.add('up'); else if (x < 0) el.classList.add('down'); };
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+
+function store(k, v) { try { v === undefined ? (v = localStorage.getItem(k)) : localStorage.setItem(k, v); } catch (e) { v = null; } return v; }
+
+function defaultSource() {
+  const h = location.hostname;
+  if (h.endsWith('github.io')) {
+    const owner = h.split('.')[0];
+    const repo = location.pathname.split('/')[1] || h;
+    return `https://raw.githubusercontent.com/${owner}/${repo}/main/state/bot.json`;
+  }
+  if (location.protocol.startsWith('http')) return 'state/local-bot.json';
+  return '';
+}
+
+let timer;
+async function load() {
+  const src = $('src').value.trim();
+  if (!src) { setStatus('add a data source below', 'warn'); return; }
+  try {
+    const r = await fetch(src + (src.includes('?') ? '&' : '?') + 't=' + Date.now(), {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    render(await r.json());
+  } catch (e) {
+    setStatus('cannot load: ' + e.message, 'down');
+  }
+}
+
+function setStatus(text, c) { const s = $('status'); s.textContent = text; s.className = 'pill ' + (c || 'muted'); }
+
+function render(s) {
+  const m = s.market || {}, lt = s.latest || {}, cfg = s.config || {}, rep = s.report || {};
+  const ok = (s.status || '').startsWith('OK');
+  setStatus(ok ? 'live' : (s.status || 'unknown'), ok ? 'up' : 'warn');
+  $('sym').textContent = `${cfg.symbol || '—'} · ${cfg.timeframe || ''} bars`;
+  $('price').textContent = m.price != null ? Number(m.price).toLocaleString(undefined, {minimumFractionDigits: 2}) : '—';
+  $('barTime').textContent = 'last closed bar ' + tm(m.last_bar_t);
+  const age = m.data_age_sec;
+  $('dataAge').textContent = age == null ? '' : `data ${Math.max(0, Math.round(age / 60))} min old`;
+  $('dataAge').className = age > 900 ? 'warn' : '';
+
+  // probability
+  const p = lt.p_up;
+  $('pUp').textContent = pct(p);
+  cls($('pUp'), p == null ? 0 : p - 0.5);
+  const g = $('gFill');
+  if (p != null) {
+    const lo = Math.min(p, 0.5), hi = Math.max(p, 0.5);
+    g.style.left = lo * 100 + '%'; g.style.width = (hi - lo) * 100 + '%';
+    g.style.background = p >= 0.5 ? 'var(--up)' : 'var(--down)';
+  }
+  const sig = $('signal');
+  sig.textContent = lt.signal || '—';
+  sig.className = 'pill ' + (/^LONG$/.test(lt.signal) ? 'up' : /^SHORT$/.test(lt.signal) ? 'down' : 'muted');
+  $('pNews').textContent = pct(lt.p_news);
+  const ns = (s.news || {}).score;
+  $('newsScore').textContent = ns == null ? '—' : (ns > 0 ? '+' : '') + ns.toFixed(2);
+  $('reasons').innerHTML = (lt.reasons || []).map(r =>
+    `<div class="reason"><span class="muted">${esc(r.name)}</span><span class="${r.effect > 0 ? 'up' : 'down'}">${r.effect > 0 ? 'pushes up' : 'pushes down'} (${r.effect.toFixed(2)})</span></div>`).join('');
+
+  // honest test
+  $('tAcc').textContent = pct(rep.accuracy);
+  $('tSkill').textContent = rep.skill_pct == null ? '—' : rep.skill_pct.toFixed(2) + '%';
+  cls($('tSkill'), rep.skill_pct || 0);
+  const bt = rep.backtest || {};
+  $('tPnl').textContent = usd(bt.net_pnl);
+  cls($('tPnl'), bt.net_pnl || 0);
+  $('tEdge').textContent = cfg.require_edge === false ? 'yes (check off)' : rep.has_edge ? 'yes' : 'no — watching only';
+  $('tEdge').className = rep.has_edge ? 'up' : 'warn';
+  $('tInfo').textContent = rep.n_test ? `Trained on ${rep.n_train} bars, tested on the next ${rep.n_test} (${tm(rep.test_from_t)} → ${tm(rep.test_to_t)}), ${bt.trades || 0} test trades, win rate ${pct(bt.win_rate, 0)}. It only trades if the test beat a no-skill guess and made money after fees.` : '';
+
+  // live record
+  const ps = (s.stats || {}).predictions || {};
+  $('lN').textContent = ps.n ?? '—';
+  $('lAcc').textContent = pct((ps.model || {}).accuracy);
+  const sk = (ps.model || {}).skill_pct, skn = (ps.news_adjusted || {}).skill_pct;
+  $('lSkill').textContent = sk == null ? '—' : sk.toFixed(2) + '%'; cls($('lSkill'), sk || 0);
+  $('lNews').textContent = skn == null ? '—' : skn.toFixed(2) + '%'; cls($('lNews'), skn || 0);
+  $('calib').innerHTML = (ps.buckets || []).map(b =>
+    `<tr><td>${b.range}</td><td>${b.n}</td><td>${pct(b.avg_p)}</td><td>${pct(b.up_rate)}</td></tr>`).join('') ||
+    '<tr><td colspan="4" class="muted">no graded predictions yet</td></tr>';
+
+  // account
+  const ac = (s.stats || {}).account || {};
+  $('aEq').textContent = usd(s.equity_now ?? s.cash);
+  $('aPnl').textContent = usd(ac.net_pnl); cls($('aPnl'), ac.net_pnl || 0);
+  $('aWin').textContent = pct(ac.win_rate, 0);
+  $('aDd').textContent = usd(ac.max_drawdown);
+  const pos = s.position;
+  $('pos').innerHTML = pos
+    ? `<b class="${pos.side > 0 ? 'up' : 'down'}">${pos.side > 0 ? 'LONG' : 'SHORT'}</b> 1 @ ${pos.entry} · stop ${pos.stop} · target ${pos.target} · ${pos.bars}/${cfg.max_hold} bars`
+    : '<span class="muted">No open position</span>';
+  drawCurve(s.equity || []);
+  $('trades').innerHTML = (s.trades || []).slice(-10).reverse().map(t =>
+    `<tr><td>${tm(t.exit_t)}</td><td>${t.side}</td><td>${t.reason}</td><td class="${t.pnl > 0 ? 'up' : 'down'}">${usd(t.pnl)}</td></tr>`).join('') ||
+    '<tr><td colspan="4" class="muted">no trades yet</td></tr>';
+
+  // news
+  const n = s.news || {};
+  $('newsSum').textContent = n.recent != null ? `Last ${n.window_hours} h: ${n.bullish} bullish, ${n.bearish} bearish of ${n.recent} headlines.` : '';
+  $('news').innerHTML = (n.headlines || []).slice(0, 15).map(h => {
+    const tag = h.tag > 0 ? '<span class="tag up">BULL</span>' : h.tag < 0 ? '<span class="tag down">BEAR</span>' : '<span class="tag muted">—</span>';
+    const link = /^https?:\/\//.test(h.link || '') ? h.link : '#';
+    return `<li>${tag}<a href="${esc(link)}" target="_blank" rel="noopener">${esc(h.title)}</a><div class="note">${esc(h.source || '')} · ${tm(h.t)}</div></li>`;
+  }).join('') || '<li class="muted">no headlines</li>';
+
+  $('updated').textContent = `Bot last ran ${tm(s.updated)} · run #${s.runs} · page refreshes every minute.`;
+}
+
+function drawCurve(pts) {
+  const svg = $('curve');
+  if (pts.length < 2) { svg.innerHTML = ''; return; }
+  const ys = pts.map(p => p[1]), lo = Math.min(...ys), hi = Math.max(...ys), span = hi - lo || 1;
+  const x = i => (i / (pts.length - 1)) * 300, y = v => 85 - ((v - lo) / span) * 80;
+  const d = ys.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('');
+  const color = ys[ys.length - 1] >= ys[0] ? 'var(--up)' : 'var(--down)';
+  svg.innerHTML = `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/>`;
+}
+
+function start() {
+  clearInterval(timer);
+  store('qt-src', $('src').value.trim());
+  load();
+  timer = setInterval(load, 60000);
+}
+
+$('src').value = store('qt-src') || defaultSource();
+$('go').onclick = start;
+$('ref').onclick = load;
+start();
+</script>
+</body>
+</html>

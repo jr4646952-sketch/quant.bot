@@ -1,9 +1,14 @@
 """Local server for Live Quant Tracker.
 
-Serves the page and relays stock / index data from Yahoo Finance (browsers can't
-fetch it directly because of CORS). Standard library only.
+Serves the page, relays Yahoo Finance data and news feeds (browsers can't fetch them
+directly because of CORS), and runs the paper bot every minute in the background,
+writing state/local-bot.json for the page. Standard library only, so it also runs
+on a phone (Android: Termux or Pydroid 3).
 
-    python server.py          -> opens http://localhost:8765/live-quant-tracker.html
+    python server.py               -> opens http://localhost:8765/live-quant-tracker.html
+    python server.py --no-browser  -> don't try to open a browser (use on phones)
+    python server.py --no-bot      -> only serve the page / data relay
+    TIMEFRAME=5m python server.py  -> local bot bar size (default 1m)
 """
 import http.server
 import json
@@ -11,6 +16,8 @@ import os
 import re
 import socketserver
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -84,7 +91,27 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+def bot_loop():
+    sys.path.insert(0, os.path.join(ROOT, "bot"))
+    os.environ.setdefault("TIMEFRAME", "1m")
+    import cloud_bot
+    cfg = cloud_bot.config()
+    path = os.path.join(ROOT, "state", "local-bot.json")
+    print(f"Paper bot: {cfg['symbol']} {cfg['timeframe']} bars, updating every minute -> {path}")
+    while True:
+        try:
+            st = cloud_bot.run_once(cfg, path)
+            lt = st.get("latest") or {}
+            p = f"  P(up)={lt['p_up']:.1%}  {lt['signal']}" if lt else ""
+            print(time.strftime("%H:%M:%S"), st.get("status"), p, flush=True)
+        except Exception as e:  # keep the server alive
+            print("bot error:", e, flush=True)
+        time.sleep(60 - time.time() % 60 + 3)  # a few seconds after each minute
+
+
 if __name__ == "__main__":
+    if "--no-bot" not in sys.argv:
+        threading.Thread(target=bot_loop, daemon=True).start()
     url = f"http://localhost:{PORT}/live-quant-tracker.html"
     with Server(("127.0.0.1", PORT), Handler) as s:
         print(f"Live Quant Tracker running at {url}  (Ctrl+C to stop)")
