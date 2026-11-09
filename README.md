@@ -29,3 +29,14 @@ CSV columns: `timestamp, event (limit|cancel|market), side (bid|ask, or buy|sell
 bid_size, ask_size, spread` (book columns are optional and describe the book *after* the event).
 
 Research tool only, not financial advice.
+
+## TradingView: Next Candle Probability (`tradingview/next_candle_probability.pine`)
+
+Pine Script v6 indicator that estimates **P(next candle closes up)** with five models:
+base rate, EWMA, order-2 Markov chain on candle colors, online logistic regression
+(RSI, return z-score, close location, EMA distance in ATRs, volume z-score) and a
+kernel nearest-neighbour pattern match, combined by a Hedge (exponential-weights) ensemble.
+A table scores each model walk-forward over the last N bars (accuracy, Brier score, weight).
+
+Install: TradingView → **Pine Editor** → paste the file → **Add to chart**.
+Alerts: "Next candle likely UP / DOWN" (fire on closed bars only).

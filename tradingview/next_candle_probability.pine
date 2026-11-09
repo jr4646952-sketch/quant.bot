@@ -1,0 +1,177 @@
+//@version=6
+// Next Candle Probability: P(next candle closes UP) from 5 quant models + an ensemble.
+//
+// Models (each one only uses data available at the close of the current bar):
+//   1. Base rate  : share of up candles over a rolling window (the benchmark to beat)
+//   2. EWMA       : exponentially weighted share of up candles (adapts to regime)
+//   3. Markov-2   : transition probabilities from the last two candle colors (decayed counts)
+//   4. Logistic   : online logistic regression (SGD) on RSI, return z-score, close location,
+//                   distance from EMA in ATRs, volume z-score, last candle color
+//   5. Pattern    : kernel-weighted nearest neighbours - past bars with similar features and
+//                   what the candle after them did
+//   6. Ensemble   : Hedge / exponential weights - models with lower recent log loss get more weight
+//
+// The table scores every model walk-forward on the last N bars (accuracy, Brier score).
+// Values on the live (unclosed) bar move until it closes; signals fire on closed bars only.
+// Research tool, not financial advice. Beating 50% is not the same as beating costs.
+indicator("Next Candle Probability", shorttitle = "NCP", overlay = false, max_bars_back = 1000)
+
+// ---------------------------------------------------------------- inputs
+baseLen  = input.int(200, "Base rate lookback", minval = 10, group = "Models")
+ewmaLen  = input.int(20, "EWMA length", minval = 2, group = "Models")
+mDecay   = input.float(0.995, "Markov count decay", minval = 0.9, maxval = 1.0, step = 0.001, group = "Models")
+lr       = input.float(0.02, "Logistic learning rate", minval = 0.0001, step = 0.005, group = "Models")
+l2       = input.float(0.001, "Logistic L2 penalty", minval = 0.0, step = 0.001, group = "Models")
+knnLen   = input.int(300, "Pattern lookback (bars)", minval = 20, maxval = 900, group = "Models")
+bw       = input.float(0.5, "Pattern kernel bandwidth", minval = 0.01, step = 0.05, group = "Models")
+eta      = input.float(2.0, "Ensemble learning rate", minval = 0.0, step = 0.1, group = "Ensemble")
+hDecay   = input.float(0.98, "Ensemble loss decay", minval = 0.5, maxval = 1.0, step = 0.005, group = "Ensemble")
+evalLen  = input.int(200, "Score window (bars)", minval = 20, group = "Display")
+upTh     = input.float(58, "Bullish threshold %", minval = 50, maxval = 100, group = "Display")
+dnTh     = input.float(42, "Bearish threshold %", minval = 0, maxval = 50, group = "Display")
+showAll  = input.bool(false, "Plot every model", group = "Display")
+showTbl  = input.bool(true, "Show table", group = "Display")
+
+// ---------------------------------------------------------------- helpers
+clamp(x, lo, hi) => math.max(lo, math.min(hi, nz(x)))
+sigmoid(z) => 1.0 / (1.0 + math.exp(-clamp(z, -30.0, 30.0)))
+pclip(p) => clamp(p, 0.001, 0.999)
+
+// walk-forward score: the prediction made on the previous bar vs. this bar's outcome
+score(p, y, len) =>
+    pp  = nz(p[1], 0.5)
+    hit = (pp >= 0.5) == (y == 1) ? 1.0 : 0.0
+    [ta.sma(hit, len), ta.sma(math.pow(pp - y, 2), len)]
+
+// ---------------------------------------------------------------- outcome & features
+int yUp = close > close[1] ? 1 : 0          // this candle closed up vs. the previous close
+float yF = yUp
+
+ret  = math.log(close / close[1])
+atr  = ta.atr(14)
+f1 = clamp((ta.rsi(close, 14) - 50) / 50, -1, 1)                                    // momentum
+f2 = clamp((ret - ta.sma(ret, 50)) / ta.stdev(ret, 50) / 3, -1, 1)                  // return z-score
+f3 = high > low ? (2 * close - high - low) / (high - low) : 0.0                     // close location
+f4 = clamp((close - ta.ema(close, 50)) / atr / 3, -1, 1)                            // trend distance
+f5 = clamp((nz(volume) - ta.sma(nz(volume), 50)) / ta.stdev(nz(volume), 50) / 3, -1, 1)  // volume
+f6 = yUp == 1 ? 1.0 : -1.0                                                          // last color
+
+// ---------------------------------------------------------------- 1. base rate, 2. EWMA
+pBase = nz(ta.sma(yF, baseLen), 0.5)
+pEwma = nz(ta.ema(yF, ewmaLen), 0.5)
+
+// ---------------------------------------------------------------- 3. Markov chain (order 2)
+var array<float> mUp  = array.new<float>(4, 0.0)
+var array<float> mTot = array.new<float>(4, 0.0)
+if bar_index >= 3
+    for i = 0 to 3
+        mUp.set(i, mUp.get(i) * mDecay)
+        mTot.set(i, mTot.get(i) * mDecay)
+    sPrev = 2 * nz(yUp[2]) + nz(yUp[1])     // state before this candle
+    mUp.set(sPrev, mUp.get(sPrev) + yUp)
+    mTot.set(sPrev, mTot.get(sPrev) + 1.0)
+sNow = 2 * nz(yUp[1]) + yUp
+pMarkov = (mUp.get(sNow) + 1.0) / (mTot.get(sNow) + 2.0)
+
+// ---------------------------------------------------------------- 4. online logistic regression
+var array<float> w = array.new<float>(7, 0.0)
+xPrev = array.from(1.0, nz(f1[1]), nz(f2[1]), nz(f3[1]), nz(f4[1]), nz(f5[1]), nz(f6[1]))
+if bar_index > 60
+    zp = 0.0
+    for i = 0 to 6
+        zp += w.get(i) * xPrev.get(i)
+    g = yF - sigmoid(zp)                    // learn from the candle that just closed
+    for i = 0 to 6
+        w.set(i, w.get(i) + lr * (g * xPrev.get(i) - l2 * w.get(i)))
+xNow = array.from(1.0, f1, f2, f3, f4, f5, f6)
+z = 0.0
+for i = 0 to 6
+    z += w.get(i) * xNow.get(i)
+pLogit = sigmoid(z)
+
+// ---------------------------------------------------------------- 5. kernel pattern match
+float pKnn = 0.5
+if bar_index > knnLen + 60
+    float sw = 0.0
+    float sy = 0.0
+    for j = 1 to knnLen
+        d1 = f1 - f1[j]
+        d2 = f2 - f2[j]
+        d3 = f3 - f3[j]
+        d4 = f4 - f4[j]
+        d = d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4
+        wj = math.exp(-d / bw)
+        sw += wj
+        sy += wj * yUp[j - 1]               // what the candle AFTER bar j did
+    pKnn := (sy + 1.0) / (sw + 2.0)
+
+// ---------------------------------------------------------------- 6. ensemble (Hedge)
+probs = array.from(pBase, pEwma, pMarkov, pLogit, pKnn)
+prevP = array.from(nz(pBase[1], 0.5), nz(pEwma[1], 0.5), nz(pMarkov[1], 0.5), nz(pLogit[1], 0.5), nz(pKnn[1], 0.5))
+var array<float> L = array.new<float>(5, 0.0)
+if bar_index > 60
+    for i = 0 to 4
+        p = pclip(prevP.get(i))
+        L.set(i, L.get(i) * hDecay + (yUp == 1 ? -math.log(p) : -math.log(1 - p)))
+minL = L.min()
+wts = array.new<float>(5, 0.0)
+sumW = 0.0
+for i = 0 to 4
+    wi = math.exp(-eta * (L.get(i) - minL))
+    wts.set(i, wi)
+    sumW += wi
+pEns = 0.0
+for i = 0 to 4
+    wts.set(i, wts.get(i) / sumW)
+    pEns += wts.get(i) * probs.get(i)
+
+// ---------------------------------------------------------------- scoring
+[accBase, brBase] = score(pBase, yUp, evalLen)
+[accEwma, brEwma] = score(pEwma, yUp, evalLen)
+[accMark, brMark] = score(pMarkov, yUp, evalLen)
+[accLog, brLog]   = score(pLogit, yUp, evalLen)
+[accKnn, brKnn]   = score(pKnn, yUp, evalLen)
+[accEns, brEns]   = score(pEns, yUp, evalLen)
+
+// ---------------------------------------------------------------- plots & alerts
+pct = pEns * 100
+plot(pct, "Ensemble P(up next) %", color = pEns >= 0.5 ? color.teal : color.red, linewidth = 2)
+plot(showAll ? pBase * 100 : na, "Base rate", color = color.gray)
+plot(showAll ? pEwma * 100 : na, "EWMA", color = color.orange)
+plot(showAll ? pMarkov * 100 : na, "Markov-2", color = color.purple)
+plot(showAll ? pLogit * 100 : na, "Logistic", color = color.blue)
+plot(showAll ? pKnn * 100 : na, "Pattern", color = color.fuchsia)
+hline(50, "50%", color = color.gray, linestyle = hline.style_dotted)
+hline(upTh, "Bullish", color = color.new(color.teal, 50))
+hline(dnTh, "Bearish", color = color.new(color.red, 50))
+bgcolor(pct >= upTh ? color.new(color.teal, 88) : pct <= dnTh ? color.new(color.red, 88) : na)
+
+bullSig = ta.crossover(pct, upTh) and barstate.isconfirmed
+bearSig = ta.crossunder(pct, dnTh) and barstate.isconfirmed
+plotshape(bullSig, "Bullish signal", shape.triangleup, location.bottom, color.teal, size = size.tiny)
+plotshape(bearSig, "Bearish signal", shape.triangledown, location.top, color.red, size = size.tiny)
+alertcondition(bullSig, "Next candle likely UP", "NCP: P(up next) crossed above the bullish threshold")
+alertcondition(bearSig, "Next candle likely DOWN", "NCP: P(up next) crossed below the bearish threshold")
+
+// ---------------------------------------------------------------- table
+fmt(x) => str.tostring(x * 100, "0.0") + "%"
+var table t = table.new(position.top_right, 6, 7, border_width = 1, bgcolor = color.new(color.black, 20))
+cellRow(r, name, p, acc, br, wt) =>
+    c = p >= upTh / 100 ? color.teal : p <= dnTh / 100 ? color.red : color.white
+    table.cell(t, 0, r, name, text_color = color.white, text_size = size.small)
+    table.cell(t, 1, r, fmt(p), text_color = c, text_size = size.small)
+    table.cell(t, 2, r, fmt(1 - p), text_color = color.white, text_size = size.small)
+    table.cell(t, 3, r, fmt(acc), text_color = color.white, text_size = size.small)
+    table.cell(t, 4, r, str.tostring(br, "0.000"), text_color = color.white, text_size = size.small)
+    table.cell(t, 5, r, wt, text_color = color.white, text_size = size.small)
+
+if showTbl and barstate.islast
+    hdr = array.from("Model", "P(up)", "P(down)", "Accuracy", "Brier", "Weight")
+    for c = 0 to 5
+        table.cell(t, c, 0, hdr.get(c), text_color = color.yellow, text_size = size.small)
+    cellRow(1, "Base rate", pBase, accBase, brBase, fmt(wts.get(0)))
+    cellRow(2, "EWMA", pEwma, accEwma, brEwma, fmt(wts.get(1)))
+    cellRow(3, "Markov-2", pMarkov, accMark, brMark, fmt(wts.get(2)))
+    cellRow(4, "Logistic", pLogit, accLog, brLog, fmt(wts.get(3)))
+    cellRow(5, "Pattern", pKnn, accKnn, brKnn, fmt(wts.get(4)))
+    cellRow(6, "ENSEMBLE", pEns, accEns, brEns, "-")
