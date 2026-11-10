@@ -15,7 +15,8 @@
 strategy("Quant Day Trader", shorttitle = "QDT", overlay = true, initial_capital = 10000,
      default_qty_type = strategy.fixed, default_qty_value = 1,
      commission_type = strategy.commission.cash_per_contract, commission_value = 0.62,
-     slippage = 1, calc_on_every_tick = false, process_orders_on_close = false)
+     slippage = 1, calc_on_every_tick = false, process_orders_on_close = false,
+     margin_long = 0, margin_short = 0)
 
 // ---------------------------------------------------------------- inputs
 tz        = input.string("America/New_York", "Time zone", group = "Session")
@@ -145,9 +146,10 @@ if strategy.position_size < 0 and score >= 2
     strategy.close("Short", comment = "Score flip")
     alert('{"action":"close","symbol":"' + syminfo.ticker + '"}', alert.freq_once_per_bar_close)
 
-// end of day / loss limit: go flat
+// end of day / loss limit: go flat at this bar's close (immediately = true), not at the next bar's open,
+// which on a regular-hours chart could be the next morning's open
 if strategy.position_size != 0 and (not inHold or lossHit)
-    strategy.close_all(comment = lossHit ? "Loss limit" : "End of day")
+    strategy.close_all(comment = lossHit ? "Loss limit" : "End of day", immediately = true)
     alert('{"action":"close","symbol":"' + syminfo.ticker + '"}', alert.freq_once_per_bar_close)
 
 // ---------------------------------------------------------------- visuals
