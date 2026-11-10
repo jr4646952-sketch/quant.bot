@@ -6,9 +6,9 @@ What it does on every run:
   3. Uses a logistic-regression model to estimate P(next bar closes higher).
      The model is trained on the oldest 70% of the data and graded on the newest 30%
      it has never seen. It only trades if that unseen test beats a "no skill" guess.
-  4. Reads NASDAQ headlines and scores them bullish / bearish. The news score gives a
-     separate "news-adjusted" probability, which is logged and graded live so you can
-     see whether the news actually helps.
+  4. Reads NASDAQ headlines (bot/news.py) and scores them bullish / bearish by topic and
+     impact. The news mood gives a separate "news-adjusted" probability, which is logged
+     and graded live so you can see whether the news actually helps.
   5. Paper trades 1 contract with a stop loss, take profit and time limit, after costs.
   6. Saves everything to a JSON file that the tracker page shows.
 
@@ -20,14 +20,13 @@ Paper money only - this never connects to a broker. Not financial advice.
 import json
 import math
 import os
-import re
 import sys
 import time
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import news  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,27 +49,6 @@ FEATURES = [
     ("range_pos", "Position in 20-bar range"),
 ]
 
-NEWS_FEEDS = {
-    "Yahoo Finance": "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EIXIC,%5ENDX,QQQ,NQ%3DF,MNQ%3DF&region=US&lang=en-US",
-    "CNBC Markets": "https://www.cnbc.com/id/20910258/device/rss/rss.html",
-    "CNBC Tech": "https://www.cnbc.com/id/19854910/device/rss/rss.html",
-    "MarketWatch": "https://feeds.content.dowjones.io/public/rss/mw_marketpulse",
-    "Nasdaq.com": "https://www.nasdaq.com/feed/rssoutbound?category=Markets",
-}
-BULL_WORDS = [
-    "rally", "rallies", "rallied", "surge", "surges", "surged", "soar", "soars", "soared", "jump", "jumps",
-    "jumped", "gain", "gains", "gained", "climb", "climbs", "climbed", "rise", "rises", "rising", "rebound",
-    "rebounds", "record high", "all-time high", "beat", "beats", "tops estimates", "upgrade", "upgraded",
-    "bullish", "rate cut", "rate cuts", "cools", "cooling inflation", "strong demand", "optimism", "boost",
-]
-BEAR_WORDS = [
-    "plunge", "plunges", "plunged", "slump", "slumps", "sink", "sinks", "sank", "tumble", "tumbles",
-    "tumbled", "fall", "falls", "fell", "drop", "drops", "dropped", "slide", "slides", "selloff", "sell-off",
-    "crash", "miss", "misses", "missed", "downgrade", "downgraded", "bearish", "recession", "layoffs",
-    "tariff", "tariffs", "rate hike", "hot inflation", "fears", "warns", "warning", "slowdown", "weak",
-]
-BULL_RE = re.compile(r"\b(" + "|".join(map(re.escape, BULL_WORDS)) + r")\b", re.I)
-BEAR_RE = re.compile(r"\b(" + "|".join(map(re.escape, BEAR_WORDS)) + r")\b", re.I)
 UA = {"User-Agent": "Mozilla/5.0 (quant.bot paper trader)"}
 
 
@@ -132,46 +110,9 @@ def fetch_bars(symbol, tf):
     return bars, r.get("meta") or {}
 
 
-def score_headline(title):
-    b, s = len(BULL_RE.findall(title)), len(BEAR_RE.findall(title))
-    return 1 if b > s else -1 if s > b else 0
-
-
-def fetch_news(max_age_h=6):
-    items, seen, errors = [], set(), []
-    now = time.time()
-    for name, url in NEWS_FEEDS.items():
-        try:
-            root = ET.fromstring(http_get(url, timeout=10))
-        except Exception as e:  # one bad feed shouldn't stop the bot
-            errors.append(f"{name}: {e.__class__.__name__}")
-            continue
-        for it in root.iter("item"):
-            title = (it.findtext("title") or "").strip()
-            key = title.lower()
-            if not title or key in seen:
-                continue
-            seen.add(key)
-            try:
-                ts = parsedate_to_datetime(it.findtext("pubDate") or "").timestamp()
-            except Exception:
-                ts = None
-            items.append({"title": title, "link": (it.findtext("link") or "").strip(),
-                          "source": name, "t": int(ts) if ts else None, "tag": score_headline(title)})
-    items.sort(key=lambda x: x["t"] or 0, reverse=True)
-    recent = [x for x in items if x["t"] and now - x["t"] <= max_age_h * 3600]
-    tagged = [x["tag"] for x in recent if x["tag"]]
-    score = sum(tagged) / len(tagged) if tagged else 0.0
-    return {
-        "score": round(score, 3),
-        "bullish": sum(1 for t in tagged if t > 0),
-        "bearish": sum(1 for t in tagged if t < 0),
-        "recent": len(recent),
-        "window_hours": max_age_h,
-        "headlines": items[:20],
-        "errors": errors,
-        "fetched": int(now),
-    }
+def fetch_news():
+    """Scored NASDAQ headlines (see bot/news.py). The bot keeps the top 40 for the dashboard."""
+    return news.fetch_news(max_age_h=6, limit=40)
 
 
 # ----------------------------------------------------------------------------- math

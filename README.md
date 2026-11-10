@@ -18,8 +18,27 @@ Every bar it:
 |---|---|
 | `bot/cloud_bot.py` | The bot (Python standard library only) |
 | `.github/workflows/paper-bot.yml` | Runs the bot on GitHub every ~5 min, free |
-| `live-quant-tracker.html` | Phone-friendly dashboard |
+| `live-quant-tracker.html` | Phone-friendly bot dashboard |
+| `news-app.html` | **News Radar:** live headlines scored bullish / bearish for MNQ, with impact level |
+| `bot/news.py` | The headline scorer (topics, impact, direction) used by the bot, the server and the page |
 | `server.py` | Runs the dashboard **and** a 1-minute bot locally (PC or Android phone) |
+
+## News Radar
+
+`news-app.html` pulls headlines every minute from Yahoo Finance, CNBC, MarketWatch, Nasdaq.com and Google
+News (Reuters, Bloomberg, ...) and marks each one:
+
+- **BULL / BEAR** from the words in the headline. Movement words flip with the subject (*stocks rise* is
+  bullish, *yields rise* or *inflation jumps* is bearish); fixed phrases like *rate cut*, *tariffs*,
+  *ceasefire*, *misses estimates* always mean the same thing. Questions are marked *unsure*.
+- **Impact `!!!` / `!!` / `!`** from the topic: Fed, CPI, jobs, tariffs, Nvidia and big tech usually move
+  the Nasdaq a lot; oil and crypto usually don't.
+- A **news mood** gauge (impact-weighted, last 6 hours) and filters: high impact, bullish, bearish,
+  Fed / data, tech / chips, tariffs / geopolitics.
+
+It is keyword matching, not understanding, and news is usually priced in within seconds. Use it to know
+*what* is moving the market, then open the story. Open it on your phone the same way as the tracker
+(`.../quant.bot/news-app.html`), or at `http://localhost:8765/news-app.html` with `server.py`.
 
 ## Three ways to run it
 

@@ -19,6 +19,8 @@ The cloud bot runs on GitHub's servers every 5 minutes, for free. It trades **pa
 1. Repo **Settings → Pages** → Source: **Deploy from a branch** → Branch **main**, folder **/ (root)** → **Save**.
 2. After a minute, open `https://YOUR-NAME.github.io/quant.bot/live-quant-tracker.html` on your phone.
    It finds `state/bot.json` automatically. In Safari/Chrome use **Share → Add to Home Screen** to get an app icon.
+3. The live news page is `https://YOUR-NAME.github.io/quant.bot/news-app.html` (cloud headlines refresh
+   every ~5 minutes with the bot; `server.py` refreshes them every minute).
 
 The page refreshes every minute. GitHub's raw links can lag up to about 5 minutes.
 To use another source, paste a `bot.json` link into the **Bot data source** box at the bottom.
