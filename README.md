@@ -55,3 +55,10 @@ Intraday strategy (1m/5m charts) that scores every closed candle from -4 to +4 u
 Bayes probability. Filters: relative volume, VWAP z-score, session window. Risk: ATR stop and
 target, max trades per day, daily loss limit, flat before the close. Sends JSON `alert()`
 messages (buy / sell / close) for webhook automation. Backtest it in the Strategy Tester first.
+
+## TradingView: Quant Buy/Sell Signals (`tradingview/quant_buy_sell_signals.pine`)
+
+Indicator that prints live BUY / SELL / exit labels on the chart with stop and target lines,
+BUY / SELL / EXIT alerts and a running win rate of past signals. Same -4..+4 quant score as the
+day trader (trend, momentum z-score, N-candle breakout, Naive Bayes probability), but works on
+any market and timeframe. Signals are fixed on candle close.
