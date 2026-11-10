@@ -47,3 +47,11 @@ Naive Bayes model run separately on 1 min, 5 min and 1 day candles (via `request
 Shows P(current candle closes up) per timeframe, a walk-forward accuracy score and the edge
 over always guessing the more common color. Background turns green/red when all three agree.
 Use it on a 1-minute chart. Prediction is fixed at the previous candle's close (no repainting).
+
+## TradingView: Quant Day Trader strategy (`tradingview/quant_day_trader.pine`)
+
+Intraday strategy (1m/5m charts) that scores every closed candle from -4 to +4 using trend
+(EMA 20/50 + VWAP), volatility-adjusted momentum z-score, opening-range breakout and a Naive
+Bayes probability. Filters: relative volume, VWAP z-score, session window. Risk: ATR stop and
+target, max trades per day, daily loss limit, flat before the close. Sends JSON `alert()`
+messages (buy / sell / close) for webhook automation. Backtest it in the Strategy Tester first.
