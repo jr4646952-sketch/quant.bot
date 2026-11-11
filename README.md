@@ -74,3 +74,15 @@ z-score vs. a coin flip.
 python bot/candle_probability.py                  # MNQ=F
 python bot/candle_probability.py --symbol QQQ --timeframes 5m,15m,1h
 ```
+
+## News-based probability (`bot/news_probability.py`)
+
+Pulls live headlines from many outlets (Yahoo Finance news search), scores each one with a
+finance word list, weights by freshness and market relevance, and turns the net sentiment into
+P(up next), capped at 40%-60% because it is not calibrated on long history. Also prints a small
+sanity check of hourly news sentiment vs. the next hour's price move.
+
+```
+python bot/news_probability.py
+python bot/news_probability.py --symbol QQQ --halflife 3 --json
+```
