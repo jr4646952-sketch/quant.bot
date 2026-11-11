@@ -62,3 +62,15 @@ Indicator that prints live BUY / SELL / exit labels on the chart with stop and t
 BUY / SELL / EXIT alerts and a running win rate of past signals. Same -4..+4 quant score as the
 day trader (trend, momentum z-score, N-candle breakout, Naive Bayes probability), but works on
 any market and timeframe. Signals are fixed on candle close.
+
+## Next-candle probability on real data (`bot/candle_probability.py`)
+
+Fetches real candles from Yahoo Finance and runs base rate, Markov-2, Naive Bayes, online
+logistic regression and a Hedge ensemble walk-forward on 1m, 5m and 1d. Prints P(next candle up)
+per model plus out-of-sample accuracy, edge over always guessing the more common color, and a
+z-score vs. a coin flip.
+
+```
+python bot/candle_probability.py                  # MNQ=F
+python bot/candle_probability.py --symbol QQQ --timeframes 5m,15m,1h
+```
