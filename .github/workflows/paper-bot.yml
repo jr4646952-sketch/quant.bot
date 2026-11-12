@@ -26,7 +26,7 @@ jobs:
       - name: Run bot
         env:
           SYMBOL: "MNQ=F"
-          TIMEFRAME: "15m"
+          TIMEFRAME: "5m"     # cloud runs every ~5 min, so 1m bars are not possible here
           START_CASH: "10000"
         run: python bot/cloud_bot.py
       - name: Save bot state
