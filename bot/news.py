@@ -59,8 +59,8 @@ CATEGORIES = [(n, w, re.compile(rx, re.I), d) for n, w, rx, d in CATEGORIES]
 MOVE_UP = r"""rally|rallies|rallied|surge|surges|surged|soar|soars|soared|jump|jumps|jumped|gain|gains|gained|climb|climbs|climbed|rise|rises|rose|rising|rebound|rebounds|rebounded|higher|up|advance|advances|advanced|boost|boosts|boosted|record high|all-time high|record close|green|hotter|hot|accelerates?|spikes?"""
 MOVE_DOWN = r"""plunge|plunges|plunged|slump|slumps|slumped|sink|sinks|sank|tumble|tumbles|tumbled|fall|falls|fell|falling|drop|drops|dropped|slide|slides|slid|lower|down|decline|declines|declined|retreat|retreats|cooler|cools|cooling|eases|easing|slows|slowing|red|rout|crash|crashes|collapses?"""
 # Fixed phrases mean the same thing for the Nasdaq whatever the subject.
-FIXED_BULL = r"""beat|beats|tops estimates|upgrade|upgrades|upgraded|bullish|rate cut|rate cuts|cut rates|cuts rates|cutting rates|strong demand|strong sales|optimism|outperform|buy rating|ceasefire|trade deal|deal reached|truce|stimulus|dovish|resilient|better than expected|upbeat|soft landing|tariff relief|tariffs? paused|tariffs? delayed|exemption|raises guidance|raises forecast"""
-FIXED_BEAR = r"""miss|misses|missed|downgrade|downgrades|downgraded|bearish|recession|layoffs|rate hike|rate hikes|hike rates|hikes rates|sticky inflation|fears|fear|warns|warning|slowdown|weak|weaker|weakness|loss|losses|worse than expected|sell rating|tariffs?|sanctions|attack|strikes?|war|shutdown|probe|lawsuit|antitrust|bubble|hawkish|cuts guidance|cuts forecast|jitters|turmoil|selloff|sell-off|default|bankruptcy|ban|bans|crackdown"""
+FIXED_BULL = r"""beat|beats|tops estimates|upgrade|upgrades|upgraded|bullish|rate cut|rate cuts|cut rates|cuts rates|cutting rates|strong demand|strong sales|optimism|outperform|buy rating|ceasefire|trade deal|deal reached|truce|stimulus|dovish|resilient|better than expected|upbeat|soft landing|tariff relief|tariffs? paused|tariffs? delayed|exemption|raises guidance|raises forecast|record profit|record revenue|record sales|approval|approved|partnership|buyback|dividend hike|strong quarter|blowout"""
+FIXED_BEAR = r"""miss|misses|missed|downgrade|downgrades|downgraded|bearish|recession|layoffs|rate hike|rate hikes|hike rates|hikes rates|sticky inflation|fears|fear|warns|warning|slowdown|weak|weaker|weakness|loss|losses|worse than expected|sell rating|tariffs?|sanctions|attack|strikes?|war|shutdown|probe|lawsuit|antitrust|bubble|hawkish|cuts guidance|cuts forecast|jitters|turmoil|selloff|sell-off|default|bankruptcy|ban|bans|crackdown|resigns?|resignation|steps down|stepping down|ousted|fired|quits|blow to|reckoning|scandal|investigation|recall|halt|outage|hack|breach|delays?|disappoints?|disappointing|cautious|caution|uncertainty"""
 BULL_RE = re.compile(r"\b(" + MOVE_UP + "|" + FIXED_BULL + r")\b", re.I)  # used by the bot's simple tag
 BEAR_RE = re.compile(r"\b(" + MOVE_DOWN + "|" + FIXED_BEAR + r")\b", re.I)
 MOVE_UP_RE, MOVE_DOWN_RE = re.compile(r"\b(" + MOVE_UP + r")\b", re.I), re.compile(r"\b(" + MOVE_DOWN + r")\b", re.I)
@@ -91,9 +91,11 @@ def score(title):
     # unless the headline is clearly about stocks themselves.
     if move and INVERSE_RE.search(head) and not STOCK_RE.search(head):
         move = -move
-    fixed = len(fb) - len(fs)
+    neg_words = [w for w in fs if NEGATE_RE.fullmatch(w)]   # "delays" is both a negation and bearish
+    fixed = len(fb) - (len(fs) - len(neg_words))
     if fixed and NEGATE_RE.search(head):   # "no rate cut", "tariffs paused"
         fixed = -fixed
+    fixed -= len(neg_words)
     total = fixed if fixed else move        # fixed phrases outrank movement verbs
     d = 1 if total > 0 else -1 if total < 0 else 0
     bulls, bears = ups + fb, downs + fs
