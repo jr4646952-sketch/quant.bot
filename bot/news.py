@@ -1,6 +1,6 @@
 """Live news scorer for the Micro E-mini Nasdaq (MNQ). Standard library only.
 
-Pulls headlines from public RSS feeds and, for each one, works out:
+Pulls headlines from public RSS feeds (news sites plus the Fed, BLS and BEA themselves) and, for each one, works out:
   * category  - what the story is about (Fed, inflation, jobs, tariffs, big tech, ...)
   * impact    - how much that kind of story usually moves the Nasdaq (3 = high, 1 = low)
   * direction - +1 bullish, -1 bearish, 0 unclear, from the words in the headline
@@ -32,7 +32,18 @@ FEEDS = {
     "MarketWatch Top": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     "Nasdaq.com": "https://www.nasdaq.com/feed/rssoutbound?category=Markets",
     "Reuters (via Google)": "https://news.google.com/rss/search?q=when:1d+(Nasdaq+OR+%22Federal+Reserve%22+OR+inflation+OR+tariffs+OR+Nvidia)&hl=en-US&gl=US&ceid=US:en",
+    "WSJ Markets": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+    # Primary sources: the agencies that publish the numbers. Slower to phrase a headline, never wrong.
+    "Federal Reserve": "https://www.federalreserve.gov/feeds/press_all.xml",
+    "BLS (CPI, jobs)": "https://www.bls.gov/feed/bls_latest.rss",
+    "BEA (GDP, PCE)": "https://apps.bea.gov/rss/rss.xml",
 }
+OFFICIAL = {"Federal Reserve", "BLS (CPI, jobs)", "BEA (GDP, PCE)"}
+OFFICIAL_WEIGHT = 1.5   # official releases count 1.5x in the news mood
+
+# Scheduled economic releases (time, impact, forecast) for the week: lets the bot and the TradingView
+# indicator stand aside around CPI, jobs, FOMC... instead of reading the reaction as order flow.
+CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # --- categories: (name, impact 1-3, regex of trigger words, fixed direction or None) -----------
 # A fixed direction means the topic itself is bullish/bearish regardless of verbs.
@@ -56,8 +67,8 @@ CATEGORIES = [(n, w, re.compile(rx, re.I), d) for n, w, rx, d in CATEGORIES]
 
 # --- direction words -----------------------------------------------------------------------
 # Movement verbs flip meaning with the subject: "stocks rise" is bullish, "yields rise" is bearish.
-MOVE_UP = r"""rally|rallies|rallied|surge|surges|surged|soar|soars|soared|jump|jumps|jumped|gain|gains|gained|climb|climbs|climbed|rise|rises|rose|rising|rebound|rebounds|rebounded|higher|up|advance|advances|advanced|boost|boosts|boosted|record high|all-time high|record close|green|hotter|hot|accelerates?|spikes?"""
-MOVE_DOWN = r"""plunge|plunges|plunged|slump|slumps|slumped|sink|sinks|sank|tumble|tumbles|tumbled|fall|falls|fell|falling|drop|drops|dropped|slide|slides|slid|lower|down|decline|declines|declined|retreat|retreats|cooler|cools|cooling|eases|easing|slows|slowing|red|rout|crash|crashes|collapses?"""
+MOVE_UP = r"""rally|rallies|rallied|surge|surges|surged|soar|soars|soared|jump|jumps|jumped|gain|gains|gained|climb|climbs|climbed|rise|rises|rose|rising|rebound|rebounds|rebounded|higher|up|advance|increase|increases|increased|advances|advanced|boost|boosts|boosted|record high|all-time high|record close|green|hotter|hot|accelerates?|spikes?"""
+MOVE_DOWN = r"""plunge|plunges|plunged|slump|slumps|slumped|sink|sinks|sank|tumble|tumbles|tumbled|fall|falls|fell|falling|drop|drops|dropped|slide|slides|slid|lower|down|decline|declines|declined|decrease|decreases|decreased|retreat|retreats|cooler|cools|cooling|eases|easing|slows|slowing|red|rout|crash|crashes|collapses?"""
 # Fixed phrases mean the same thing for the Nasdaq whatever the subject.
 FIXED_BULL = r"""beat|beats|tops estimates|upgrade|upgrades|upgraded|bullish|rate cut|rate cuts|cut rates|cuts rates|cutting rates|strong demand|strong sales|optimism|outperform|buy rating|ceasefire|trade deal|deal reached|truce|stimulus|dovish|resilient|better than expected|upbeat|soft landing|tariff relief|tariffs? paused|tariffs? delayed|exemption|raises guidance|raises forecast"""
 FIXED_BEAR = r"""miss|misses|missed|downgrade|downgrades|downgraded|bearish|recession|layoffs|rate hike|rate hikes|hike rates|hikes rates|sticky inflation|fears|fear|warns|warning|slowdown|weak|weaker|weakness|loss|losses|worse than expected|sell rating|tariffs?|sanctions|attack|strikes?|war|shutdown|probe|lawsuit|antitrust|bubble|hawkish|cuts guidance|cuts forecast|jitters|turmoil|selloff|sell-off|default|bankruptcy|ban|bans|crackdown"""
@@ -88,8 +99,11 @@ def score(title):
     fs = [m.group(0).lower() for m in FIXED_BEAR_RE.finditer(head)]
     move = len(ups) - len(downs)
     # "Inflation jumps" / "yields rise" / "oil surges" are bearish for stocks, and vice versa,
-    # unless the headline is clearly about stocks themselves.
-    if move and INVERSE_RE.search(head) and not STOCK_RE.search(head):
+    # unless the headline is clearly about stocks themselves. Only the subject (the words before the
+    # first movement verb) counts: "payrolls rise; unemployment rate steady" is about payrolls.
+    first = min((m.start() for m in (MOVE_UP_RE.search(head), MOVE_DOWN_RE.search(head)) if m), default=0)
+    subject = head[:first] if first > 0 else head
+    if move and INVERSE_RE.search(subject) and not STOCK_RE.search(subject):
         move = -move
     fixed = len(fb) - len(fs)
     if fixed and NEGATE_RE.search(head):   # "no rate cut", "tariffs paused"
@@ -155,13 +169,18 @@ def fetch_news(max_age_h=6, limit=60, feeds=None):
                 continue
             seen.add(key)
             d, impact, cats, why, conf = score(title)
-            items.append({"title": title, "link": link, "source": source, "t": _ts(date),
-                          "tag": d, "impact": impact, "cats": cats, "why": why, "conf": conf})
+            item = {"title": title, "link": link, "source": source, "t": _ts(date),
+                    "tag": d, "impact": impact, "cats": cats, "why": why, "conf": conf}
+            if name in OFFICIAL:
+                item["official"] = True
+            items.append(item)
     items.sort(key=lambda x: x["t"] or 0, reverse=True)
     recent = [x for x in items if x["t"] and now - x["t"] <= max_age_h * 3600]
     # Mood: impact-weighted average direction of recent headlines that have a direction.
-    wsum = sum(x["impact"] for x in recent if x["tag"])
-    mood = sum(x["tag"] * x["impact"] for x in recent) / wsum if wsum else 0.0
+    # Official releases (Fed, BLS, BEA) count extra: they are the source the others are reporting on.
+    wt = lambda x: x["impact"] * (OFFICIAL_WEIGHT if x.get("official") else 1.0)
+    wsum = sum(wt(x) for x in recent if x["tag"])
+    mood = sum(x["tag"] * wt(x) for x in recent) / wsum if wsum else 0.0
     high = [x for x in recent if x["impact"] >= 3 and x["tag"]]
     return {
         "score": round(mood, 3),
@@ -178,6 +197,23 @@ def fetch_news(max_age_h=6, limit=60, feeds=None):
     }
 
 
+def fetch_calendar(countries=("USD",), impacts=("High", "Medium")):
+    """This week's scheduled releases for the given countries, oldest first.
+    Each: {"t": unix time, "title", "impact": 3 (high) / 2 (medium), "forecast", "previous"}."""
+    raw = json.loads(http_get(CALENDAR_URL, timeout=15))
+    events = []
+    for e in raw if isinstance(raw, list) else []:
+        if e.get("country") not in countries or e.get("impact") not in impacts:
+            continue
+        t = _ts(e.get("date") or "")
+        if not t:
+            continue
+        events.append({"t": t, "title": (e.get("title") or "").strip(), "impact": 3 if e.get("impact") == "High" else 2,
+                       "forecast": e.get("forecast") or "", "previous": e.get("previous") or ""})
+    events.sort(key=lambda x: x["t"])
+    return {"events": events, "fetched": int(time.time())}
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:  # score headlines given on the command line
         for h in sys.argv[1:]:
@@ -185,6 +221,12 @@ if __name__ == "__main__":
         sys.exit()
     n = fetch_news()
     print(f"mood {n['score']:+.2f}  bull {n['bullish']}  bear {n['bearish']}  errors {n['errors']}")
+    try:
+        for ev in fetch_calendar()["events"]:
+            print(time.strftime("%a %H:%M", time.localtime(ev["t"])), "!" * ev["impact"], ev["title"],
+                  f"(forecast {ev['forecast'] or '-'}, previous {ev['previous'] or '-'})")
+    except Exception as e:
+        print("calendar unavailable:", e)
     for h in n["headlines"][:30]:
         tag = {1: "BULL", -1: "BEAR", 0: "----"}[h["tag"]]
         print(f"{tag} {'!' * h['impact']:<3} {', '.join(h['cats']):<18} {h['title'][:80]}  [{h['source']}]")

@@ -13,6 +13,16 @@ Every bar it:
    saw, including a paper-trading test **after fees and slippage**. It only trades if that test beat a
    no-skill guess and made money.
 5. Paper trades 1 contract with a stop loss, take profit and time limit. It never connects to a broker.
+6. Works out **dealer gamma levels** (gamma flip, call wall, put wall) from free CBOE QQQ + NDX option data,
+   reads the economic calendar, and writes a one-line **TradingView feed** for the indicator below.
+
+## TradingView indicator: gamma + order flow
+
+[`tradingview/gamma_orderflow_signal.pine`](tradingview/gamma_orderflow_signal.pine) is a TradingView indicator
+that turns intrabar order flow (volume delta, CVD, absorption, divergence), dealer gamma, a Kalman-filter trend,
+VWAP and the news into one BUY / SELL score with stop and target. It grades itself on your chart (win rate,
+average R after costs, and an edge check). Install steps and how to read it:
+[tradingview/README.md](tradingview/README.md).
 
 | File | What it is |
 |---|---|
@@ -20,13 +30,17 @@ Every bar it:
 | `.github/workflows/paper-bot.yml` | Runs the bot on GitHub every ~5 min, free |
 | `live-quant-tracker.html` | Phone-friendly bot dashboard |
 | `news-app.html` | **News Radar:** live headlines scored bullish / bearish for MNQ, with impact level |
-| `bot/news.py` | The headline scorer (topics, impact, direction) used by the bot, the server and the page |
+| `bot/news.py` | The headline scorer (topics, impact, direction) and economic calendar, used by the bot, the server and the page |
+| `bot/gamma.py` | Dealer gamma levels (flip, call wall, put wall) from free CBOE QQQ + NDX option chains |
+| `tradingview/gamma_orderflow_signal.pine` | TradingView indicator: order flow + gamma + quant + news BUY/SELL score |
 | `server.py` | Runs the dashboard **and** a 1-minute bot locally (PC or Android phone) |
 
 ## News Radar
 
-`news-app.html` pulls headlines every minute from Yahoo Finance, CNBC, MarketWatch, Nasdaq.com and Google
-News (Reuters, Bloomberg, ...) and marks each one:
+`news-app.html` pulls headlines every minute from Yahoo Finance, CNBC, MarketWatch, WSJ Markets, Nasdaq.com and
+Google News (Reuters, Bloomberg, ...), plus the primary sources: **Federal Reserve** press releases, **BLS** (CPI,
+jobs) and **BEA** (GDP, PCE), which count 1.5× in the news mood because they are the source the others report on.
+It marks each headline:
 
 - **BULL / BEAR** from the words in the headline. Movement words flip with the subject (*stocks rise* is
   bullish, *yields rise* or *inflation jumps* is bearish); fixed phrases like *rate cut*, *tariffs*,

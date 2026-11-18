@@ -1,0 +1,703 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+//  Gamma + Order Flow Signal  ·  quant.bot
+//
+//  One BUY / SELL score (-100 … +100) built from:
+//    1. Order flow     – volume delta from intrabar (lower-timeframe) bars, flow imbalance,
+//                        cumulative delta (CVD), absorption and CVD divergence.
+//    2. Dealer gamma   – pasted gamma flip / call wall / put wall (quant.bot computes these
+//                        from CBOE option open interest), with a fallback proxy from
+//                        realised mean reversion (variance ratio) and the VIX curve.
+//                        Positive gamma → dealers dampen moves → fade stretches.
+//                        Negative gamma → dealers chase moves  → follow the flow.
+//    3. Quant engine   – Kalman-filter trend, VWAP z-score, developing POC, news-shock
+//                        detector, optional adaptive (IC-weighted) component weights.
+//    4. News           – pasted news mood and high-impact event times; signals pause
+//                        around scheduled releases (CPI, jobs, FOMC …).
+//
+//  It also grades itself on your chart (win rate, average R after costs, and the
+//  information coefficient of the score) so you can see if it has an edge on this
+//  symbol and timeframe before you trust it.
+//
+//  Signals use closed bars only (no repainting). Not financial advice.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("Gamma + Order Flow Signal [quant.bot]", shorttitle = "GOF Signal", overlay = false, precision = 0,
+     max_labels_count = 300, max_lines_count = 150, max_bars_back = 1000)
+
+// ───────────────────────────── inputs
+const string G_SIG  = "1 · Signal"
+const string G_OF   = "2 · Order flow"
+const string G_GEX  = "3 · Gamma + news (paste from quant.bot)"
+const string G_Q    = "4 · Quant engine"
+const string G_RISK = "5 · Trade plan + self-test"
+const string G_VIS  = "6 · Display"
+const string TZ     = "America/New_York"
+const string M_IB   = "Intrabar volume (most accurate)"
+const string M_BAR  = "Bar estimate (fast)"
+
+int    thrIn     = input.int(35, "Signal threshold", minval = 5, maxval = 95, group = G_SIG,
+     tooltip = "BUY when the score rises above this, SELL when it falls below minus this. Higher = fewer, stronger signals.")
+int    strongIn  = input.int(55, "Strong signal threshold", minval = 10, maxval = 100, group = G_SIG)
+float  agreeIn   = input.float(0.6, "Min. agreement of components", minval = 0, maxval = 1, step = 0.05, group = G_SIG,
+     tooltip = "Share of the weighted evidence that must point the same way as the score.")
+int    coolIn    = input.int(6, "Min. bars between signals", minval = 1, group = G_SIG)
+int    smoothIn  = input.int(3, "Score smoothing (bars)", minval = 1, maxval = 20, group = G_SIG)
+bool   confirmIn = input.bool(true, "Signals only on bar close (no repaint)", group = G_SIG)
+
+string ofMethod  = input.string(M_IB, "Delta method", options = [M_IB, M_BAR], group = G_OF,
+     tooltip = "Intrabar: classifies every lower-timeframe bar as buying or selling (like TradingView's Volume Delta). Bar estimate: splits each bar's volume by where it closed in its range. Bars too old for intrabar data fall back to the estimate.")
+bool   ltfAutoIn = input.bool(true, "Auto intrabar timeframe", group = G_OF)
+string ltfIn     = input.timeframe("1", "Intrabar timeframe (when not auto)", group = G_OF)
+int    ofLen     = input.int(10, "Flow window (bars)", minval = 2, group = G_OF)
+int    divLen    = input.int(20, "Divergence lookback (bars)", minval = 5, group = G_OF)
+float  absThr    = input.float(1.8, "Absorption: delta z-score", minval = 0.5, step = 0.1, group = G_OF,
+     tooltip = "A bar with delta this many standard deviations from normal that fails to move price counts as absorption.")
+string vwapMode  = input.string("Session", "VWAP / profile reset", options = ["Session", "RTH 09:30 ET", "Week"], group = G_OF)
+
+string feedIn    = input.text_area("", "quant.bot feed or levels", group = G_GEX,
+     tooltip = "Paste the 'TradingView feed' line from the quant.bot dashboard, e.g.\nG=24850,25200,24500,25000;N=0.32;E=1118@0830,1118@1400\n\nG = gamma flip, call wall, put wall, then any extra key levels (use 0 to skip one)\nN = news mood -1 … +1\nE = high-impact event times, MMDD@HHMM New York time\n\nYou can also type levels from any GEX source: 24850,25200,24500")
+bool   etfConv   = input.bool(false, "Levels are ETF prices → convert to this chart", group = G_GEX,
+     tooltip = "Turn on if you pasted QQQ (or SPY) levels while charting NQ/MNQ. Uses the live chart / ETF price ratio.")
+string etfSym    = input.symbol("NASDAQ:QQQ", "ETF the levels came from", group = G_GEX)
+int    liveHours = input.int(24, "Levels + news apply to the last N hours", minval = 1, maxval = 168, group = G_GEX,
+     tooltip = "Pasted levels describe today's options positioning, so they are not applied to older bars (that would be look-ahead). Paste a fresh feed each morning.")
+float  wallZone  = input.float(0.25, "Wall zone (× daily ATR)", minval = 0.05, step = 0.05, group = G_GEX)
+int    newsPts   = input.int(10, "Max news tilt (score points)", minval = 0, maxval = 30, group = G_GEX)
+int    evBefore  = input.int(10, "Pause signals: minutes before event", minval = 0, group = G_GEX)
+int    evAfter   = input.int(15, "Pause signals: minutes after event", minval = 0, group = G_GEX)
+bool   useVix    = input.bool(true, "Use VIX curve in the gamma proxy", group = G_GEX)
+string vixSym    = input.symbol("CBOE:VIX", "VIX", group = G_GEX)
+string vix3Sym   = input.symbol("CBOE:VIX3M", "VIX 3-month", group = G_GEX)
+
+int    normLen   = input.int(200, "Normalization window (bars)", minval = 50, group = G_Q)
+float  kfQ       = input.float(0.05, "Kalman trend responsiveness", minval = 0.001, step = 0.01, group = G_Q)
+int    vrLen     = input.int(120, "Variance-ratio window (bars)", minval = 30, group = G_Q)
+int    vrK       = input.int(8, "Variance-ratio horizon (bars)", minval = 2, group = G_Q)
+float  shockZ    = input.float(4.0, "News-shock volume z-score", minval = 2, step = 0.5, group = G_Q)
+float  wFlowIn   = input.float(1.0, "Weight · order-flow imbalance", minval = 0, maxval = 3, step = 0.1, group = G_Q)
+float  wExhIn    = input.float(1.0, "Weight · absorption / divergence", minval = 0, maxval = 3, step = 0.1, group = G_Q)
+float  wTrendIn  = input.float(1.0, "Weight · Kalman trend", minval = 0, maxval = 3, step = 0.1, group = G_Q)
+float  wVwapIn   = input.float(1.0, "Weight · VWAP position", minval = 0, maxval = 3, step = 0.1, group = G_Q)
+float  wWallIn   = input.float(1.0, "Weight · gamma walls", minval = 0, maxval = 3, step = 0.1, group = G_Q)
+bool   adaptIn   = input.bool(false, "Adaptive weights (learn from this chart)", group = G_Q,
+     tooltip = "Scales each component by how well it predicted the next bars on this chart (rolling information coefficient, past data only). Needs a long history; on short samples it mostly learns noise.")
+int    icLen     = input.int(1000, "Learning / edge-check window (bars)", minval = 100, group = G_Q)
+
+int    horizon   = input.int(6, "Forecast horizon (bars)", minval = 1, maxval = 100, group = G_RISK)
+float  stopAtr   = input.float(1.5, "Stop (× ATR)", minval = 0.25, step = 0.25, group = G_RISK)
+float  tgtAtr    = input.float(2.0, "Target (× ATR)", minval = 0.25, step = 0.25, group = G_RISK)
+bool   wallTgt   = input.bool(true, "Cap targets at the gamma walls", group = G_RISK)
+int    maxHold   = input.int(12, "Time exit (bars)", minval = 1, group = G_RISK)
+float  costTk    = input.float(2, "Round-trip cost (ticks)", minval = 0, step = 0.5, group = G_RISK)
+
+bool   showVwap  = input.bool(true, "VWAP + bands", group = G_VIS)
+bool   showPoc   = input.bool(true, "Developing POC", group = G_VIS)
+bool   showLvls  = input.bool(true, "Gamma levels", group = G_VIS)
+bool   showSigs  = input.bool(true, "BUY / SELL labels", group = G_VIS)
+bool   showPlan  = input.bool(true, "Stop / target of the last signal", group = G_VIS)
+bool   showTbl   = input.bool(true, "Dashboard table", group = G_VIS)
+string tblPos    = input.string("Top right", "Table position", options = ["Top right", "Bottom right", "Top left", "Bottom left"], group = G_VIS)
+bool   barCol    = input.bool(false, "Color price bars by score", group = G_VIS)
+color  cBuy      = input.color(#089981, "Buy color", group = G_VIS)
+color  cSell     = input.color(#F23645, "Sell color", group = G_VIS)
+
+// ───────────────────────────── helpers
+tanh(float x) =>
+    float e = math.exp(2.0 * math.max(-20.0, math.min(20.0, x)))
+    (e - 1.0) / (e + 1.0)
+
+zscore(float x, int len) =>
+    float m = ta.sma(x, len)
+    float s = ta.stdev(x, len)
+    s > 0 ? (x - m) / s : 0.0
+
+sdScale(float x, int len) =>
+    float s = ta.stdev(x, len)
+    s > 0 ? x / s : 0.0
+
+etMinutes(int t) =>
+    hour(t, TZ) * 60 + minute(t, TZ)
+
+pad2(int x) =>
+    x < 10 ? "0" + str.tostring(x) : str.tostring(x)
+
+signed(float x, string fmt) =>
+    na(x) ? "—" : (x > 0 ? "+" : "") + str.tostring(x, fmt)
+
+px(float x) =>
+    na(x) ? "—" : str.tostring(x, format.mintick)
+
+// ───────────────────────────── pasted feed (gamma levels, news mood, events)
+type Feed
+    float flip = na
+    float callWall = na
+    float putWall = na
+    array<float> extra
+    float news = na
+    array<int> events
+    array<int> eventDays
+
+parseFeed(string raw) =>
+    Feed f = Feed.new(extra = array.new<float>(), events = array.new<int>(), eventDays = array.new<int>())
+    string s = str.upper(raw)
+    s := str.replace_all(s, " ", "")
+    s := str.replace_all(s, "\n", ";")
+    s := str.replace_all(s, "|", ";")
+    s := str.replace_all(s, "+", "")
+    array<string> secs = str.split(s, ";")
+    for sec in secs
+        if str.length(sec) > 0
+            string key = "G"
+            string val = sec
+            if str.contains(sec, "=")
+                array<string> kv = str.split(sec, "=")
+                key := kv.get(0)
+                val := kv.size() > 1 ? kv.get(1) : ""
+            if key == "G"
+                array<string> nums = str.split(val, ",")
+                for [i, p] in nums
+                    float x = str.tonumber(p)
+                    float lv = na(x) or x <= 0 ? na : x
+                    if i == 0
+                        f.flip := lv
+                    else if i == 1
+                        f.callWall := lv
+                    else if i == 2
+                        f.putWall := lv
+                    else if not na(lv)
+                        f.extra.push(lv)
+            else if key == "N"
+                float x = str.tonumber(val)
+                if not na(x)
+                    f.news := math.max(-1.0, math.min(1.0, x))
+            else if key == "E"
+                array<string> toks = str.split(str.replace_all(val, ":", ""), ",")
+                for tok in toks
+                    int md = 0
+                    string hm = tok
+                    if str.contains(tok, "@")
+                        array<string> pr = str.split(tok, "@")
+                        float mdx = str.tonumber(pr.get(0))
+                        md := na(mdx) ? -1 : int(mdx)
+                        hm := pr.size() > 1 ? pr.get(1) : ""
+                    float x = str.tonumber(hm)
+                    if md >= 0 and not na(x) and x >= 0 and x < 2400
+                        f.events.push(int(math.floor(x / 100) * 60 + x % 100))
+                        f.eventDays.push(md)
+    f
+
+var Feed FD = parseFeed(feedIn)
+
+// ───────────────────────────── basics
+float atr    = ta.atr(14)
+float atrS   = math.max(nz(atr, high - low), syminfo.mintick)
+float dAtrRq = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+float dAtr   = nz(dAtrRq, atrS * 15)
+int   tfSec  = timeframe.in_seconds()
+float trNow  = ta.tr(true)
+
+bool newDay  = timeframe.change("D")
+bool newWeek = timeframe.change("W")
+int  etm     = etMinutes(time)
+int  etmPrev = nz(etm[1], etm)
+bool newRth  = etm >= 570 and (etmPrev < 570 or etmPrev > etm)
+bool newSess = barstate.isfirst or (vwapMode == "Session" ? newDay : vwapMode == "Week" ? newWeek : newRth)
+
+// ───────────────────────────── 1. order flow: volume delta
+string autoLtf = timeframe.isseconds ? "1S" : timeframe.isintraday ? (tfSec <= 3600 ? "1" : "5") : timeframe.isdaily ? "15" : "60"
+string ltf     = ltfAutoIn or timeframe.in_seconds(ltfIn) > tfSec ? autoLtf : ltfIn
+[ibO, ibC, ibV] = request.security_lower_tf(syminfo.tickerid, ltf, [open, close, volume])
+
+var int   ibDir  = 0
+var float ibPrev = na
+float buyV  = 0.0
+float sellV = 0.0
+int   ibN   = ofMethod == M_IB ? array.size(ibC) : 0
+if ibN > 0
+    for i = 0 to ibN - 1
+        float c_ = ibC.get(i)
+        float o_ = ibO.get(i)
+        float v_ = nz(ibV.get(i))
+        // up bar = buying, down bar = selling, unchanged = tick rule vs. the previous intrabar
+        ibDir := c_ > o_ ? 1 : c_ < o_ ? -1 : not na(ibPrev) and c_ > ibPrev ? 1 : not na(ibPrev) and c_ < ibPrev ? -1 : ibDir
+        if ibDir > 0
+            buyV += v_
+        else if ibDir < 0
+            sellV += v_
+        else
+            buyV += v_ * 0.5
+            sellV += v_ * 0.5
+        ibPrev := c_
+float prevClose = nz(close[1], open)
+float barRng    = high - low
+float clvFrac   = barRng > 0 ? (close - low) / barRng : close > prevClose ? 1.0 : close < prevClose ? 0.0 : 0.5
+if ibN == 0
+    buyV  := nz(volume) * clvFrac
+    sellV := nz(volume) - buyV
+
+float vol   = buyV + sellV
+float delta = buyV - sellV
+var float cumVol = 0.0
+cumVol += vol
+bool hasVol = cumVol > 0
+
+var float cvd = 0.0
+cvd += delta
+var float sCvd = 0.0
+if newSess
+    sCvd := 0.0
+sCvd += delta
+
+// flow imbalance: share of recent volume that was net buying, vs. its own history
+float sumD  = math.sum(delta, ofLen)
+float sumV  = math.sum(vol, ofLen)
+float imb   = sumV > 0 ? sumD / sumV : 0.0
+float cFlowRaw = tanh(zscore(imb, normLen) / 1.5)
+
+// absorption (big delta, no price result) + CVD divergence at new highs / lows
+float dSd   = ta.stdev(delta, normLen)
+float dZ    = dSd > 0 ? delta / dSd : 0.0
+float body  = (close - open) / atrS
+bool absorbed = math.abs(dZ) >= absThr and (math.sign(body) != math.sign(delta) or math.abs(body) < 0.25)
+float exhEvt = absorbed ? -math.sign(delta) * math.min(math.abs(dZ) / (2 * absThr), 1.0) : 0.0
+float cvdLo = ta.lowest(cvd, divLen)[1]
+float cvdHi = ta.highest(cvd, divLen)[1]
+float pxLo  = ta.lowest(low, divLen)
+float pxHi  = ta.highest(high, divLen)
+float divScale = dSd * math.sqrt(divLen)
+bool bullDiv = false
+bool bearDiv = false
+if divScale > 0 and not na(cvdLo)
+    if low <= pxLo
+        float m_ = (cvd - cvdLo) / divScale
+        if m_ > 0.25
+            exhEvt += math.min(m_, 1.0)
+            bullDiv := true
+    if high >= pxHi
+        float m_ = (cvdHi - cvd) / divScale
+        if m_ > 0.25
+            exhEvt -= math.min(m_, 1.0)
+            bearDiv := true
+var float exhAcc = 0.0
+exhAcc := exhAcc * 0.8 + exhEvt
+float cExhRaw = tanh(exhAcc)
+
+// ───────────────────────────── 3a. Kalman filter trend (level + velocity)
+var float kx  = na
+var float kv  = 0.0
+var float p11 = 0.0
+var float p12 = 0.0
+var float p21 = 0.0
+var float p22 = 0.0
+float kR = atrS * atrS
+float kQ = kfQ * kR
+if na(kx)
+    kx  := close
+    p11 := kR
+    p22 := kR
+else
+    float xp  = kx + kv
+    float a11 = p11 + p12 + p21 + p22 + 0.25 * kQ
+    float a12 = p12 + p22 + 0.5 * kQ
+    float a21 = p21 + p22 + 0.5 * kQ
+    float a22 = p22 + kQ
+    float sK  = a11 + kR
+    float k1  = a11 / sK
+    float k2  = a21 / sK
+    float innov = close - xp
+    kx  := xp + k1 * innov
+    kv  := kv + k2 * innov
+    p11 := (1 - k1) * a11
+    p12 := (1 - k1) * a12
+    p21 := a21 - k2 * a11
+    p22 := a22 - k2 * a12
+float cTrend = tanh(sdScale(kv / atrS, normLen) / 1.5)
+
+// ───────────────────────────── 3b. VWAP + developing POC
+float wV = hasVol ? nz(volume) : 1.0
+var float sPV  = 0.0
+var float sW   = 0.0
+var float sPV2 = 0.0
+if newSess
+    sPV  := 0.0
+    sW   := 0.0
+    sPV2 := 0.0
+sPV  += hlc3 * wV
+sW   += wV
+sPV2 += hlc3 * hlc3 * wV
+float vwap_ = sW > 0 ? sPV / sW : hlc3
+float vSd   = sW > 0 ? math.sqrt(math.max(sPV2 / sW - vwap_ * vwap_, 0.0)) : 0.0
+float vz    = (close - vwap_) / math.max(vSd, 0.5 * atrS)
+
+var map<int, float> prof = map.new<int, float>()
+var float binSz  = na
+var int   pocKey = na
+var float pocVol = 0.0
+if newSess
+    prof.clear()
+    binSz  := math.max(syminfo.mintick, dAtr / 40.0)
+    pocVol := 0.0
+    pocKey := na
+int kLo    = int(math.round(low / binSz))
+int kHi    = int(math.round(high / binSz))
+int stride = math.max(1, int(math.ceil((kHi - kLo + 1) / 60.0)))
+int nB     = int(math.floor((kHi - kLo) / stride)) + 1
+float perBin = wV / nB
+for k = 0 to nB - 1
+    int key = kLo + k * stride
+    float nv = nz(prof.get(key)) + perBin
+    prof.put(key, nv)
+    if nv > pocVol
+        pocVol := nv
+        pocKey := key
+float poc = na(pocKey) ? na : pocKey * binSz
+
+// ───────────────────────────── 2. gamma regime
+// realised gamma proxy: variance ratio < 1 = moves mean-revert (dealer long gamma)
+float r1 = math.log(close / nz(close[1], close))
+float rk = math.log(close / nz(close[vrK], close))
+float v1 = ta.variance(r1, vrLen)
+float vk = ta.variance(rk, vrLen)
+float vr = v1 > 0 ? vk / (vrK * v1) : 1.0
+float gVr = tanh((1.0 - vr) * 3.0)
+// VIX curve: VIX above VIX3M (backwardation) = stress, usually negative gamma
+string vixReq  = useVix ? vixSym : syminfo.tickerid
+string vix3Req = useVix ? vix3Sym : syminfo.tickerid
+float vixC  = request.security(vixReq, timeframe.period, close, ignore_invalid_symbol = true)
+float vix3C = request.security(vix3Req, timeframe.period, close, ignore_invalid_symbol = true)
+float ts    = useVix and vix3C > 0 ? vixC / vix3C : na
+float gTs   = na(ts) ? na : tanh((0.92 - ts) * 12.0)
+float gProxy = na(gTs) ? gVr : 0.6 * gVr + 0.4 * gTs
+
+// pasted levels (only on recent bars: they describe today's positioning)
+bool  liveWin = time >= last_bar_time - liveHours * 3600000
+string etfReq = etfConv ? etfSym : syminfo.tickerid
+float etfC  = request.security(etfReq, timeframe.period, close, ignore_invalid_symbol = true)
+float conv  = etfConv ? (etfC > 0 ? close / etfC : na) : 1.0
+float flipC = FD.flip * conv
+float cwC   = FD.callWall * conv
+float pwC   = FD.putWall * conv
+bool  gexOn = liveWin and (not na(flipC) or not na(cwC) or not na(pwC))
+float gLvl  = gexOn and not na(flipC) ? tanh((close - flipC) / (wallZone * dAtr)) : na
+float gamma = na(gLvl) ? gProxy : 0.75 * gLvl + 0.25 * gProxy
+
+// news shock: huge volume + huge range → don't fade it
+float volZ = zscore(vol, normLen)
+bool shock = hasVol and volZ >= shockZ and trNow >= 2.0 * atrS
+var int lastShock = -100000
+if shock
+    lastShock := bar_index
+bool shockOn = bar_index - lastShock <= 3
+// alpha = weight on mean reversion (1 = strong positive gamma, 0 = strong negative gamma)
+float alpha = (1.0 + gamma) / 2.0 * (shockOn ? 0.3 : 1.0)
+
+// VWAP: fade stretches in positive gamma, follow acceptance in negative gamma
+float vMR   = -tanh(math.sign(vz) * math.max(math.abs(vz) - 1.0, 0.0) * 1.2)
+float vTR   = tanh(vz * 0.7)
+float cVwap = alpha * vMR + (1.0 - alpha) * vTR
+
+// gamma walls: support / resistance inside the zone, acceleration once broken in negative gamma
+float cWall = na
+if gexOn
+    float zone = wallZone * dAtr
+    float acc  = 0.0
+    if not na(cwC)
+        float d_ = (cwC - close) / zone
+        if d_ >= 0 and d_ < 1
+            acc -= (1 - d_) * (0.5 + 0.5 * alpha)
+        else if d_ < 0
+            acc += math.min(-d_, 1.0) * ((1 - alpha) - 0.5 * alpha)
+    if not na(pwC)
+        float d_ = (close - pwC) / zone
+        if d_ >= 0 and d_ < 1
+            acc += (1 - d_) * (0.5 + 0.5 * alpha)
+        else if d_ < 0
+            acc -= math.min(-d_, 1.0) * ((1 - alpha) - 0.5 * alpha)
+    cWall := acc == 0 ? na : math.max(-1.0, math.min(1.0, acc))
+
+// ───────────────────────────── score
+float cFlow = hasVol ? cFlowRaw : na
+float cExh  = hasVol ? cExhRaw : na
+
+// realised forward move, used only for learning / grading (past bars only)
+float fwdRet = (close - close[horizon]) / nz(atrS[horizon], atrS)
+
+icMult(float comp) =>
+    float ic = ta.correlation(comp[horizon], fwdRet, icLen)
+    float t  = nz(ic) * math.sqrt(float(icLen) / horizon)
+    adaptIn ? math.max(0.0, math.min(2.5, 1.0 + t / 2.0)) : 1.0
+
+float mFlow  = icMult(nz(cFlow))
+float mExh   = icMult(nz(cExh))
+float mTrend = icMult(cTrend)
+float mVwap  = icMult(cVwap)
+
+//                                   flow  exhaust trend  vwap  walls
+var array<float> WPOS = array.from(0.20, 0.25, 0.10, 0.25, 0.20)   // positive gamma: mean reversion
+var array<float> WNEG = array.from(0.30, 0.10, 0.35, 0.15, 0.10)   // negative gamma: momentum
+array<float> C = array.from(cFlow, cExh, cTrend, cVwap, cWall)
+array<float> U = array.from(wFlowIn * mFlow, wExhIn * mExh, wTrendIn * mTrend, wVwapIn * mVwap, wWallIn)
+array<float> W = array.new<float>(5, 0.0)
+float num = 0.0
+float den = 0.0
+for i = 0 to 4
+    float c_ = C.get(i)
+    if not na(c_)
+        float w_ = (alpha * WPOS.get(i) + (1.0 - alpha) * WNEG.get(i)) * U.get(i)
+        W.set(i, w_)
+        num += w_ * c_
+        den += w_
+float rawScore = den > 0 ? 100.0 * num / den : 0.0
+
+float aNum = 0.0
+float aDen = 0.0
+for i = 0 to 4
+    float c_ = C.get(i)
+    if not na(c_)
+        float wa = W.get(i) * math.abs(c_)
+        aDen += wa
+        if math.sign(c_) == math.sign(rawScore)
+            aNum += wa
+float agree = aDen > 0 ? aNum / aDen : 0.0
+
+bool  newsOn = liveWin and not na(FD.news)
+float newsTilt = newsOn ? newsPts * FD.news : 0.0
+float score  = math.max(-100.0, math.min(100.0, rawScore + newsTilt))
+float scoreS = ta.ema(score, smoothIn)
+
+// ───────────────────────────── 4. scheduled news: pause signals around releases
+int  barMd   = month(time, TZ) * 100 + dayofmonth(time, TZ)
+bool lastDay = year(time, TZ) == year(last_bar_time, TZ) and month(time, TZ) == month(last_bar_time, TZ) and dayofmonth(time, TZ) == dayofmonth(last_bar_time, TZ)
+bool inEvent = false
+if timeframe.isintraday and liveWin and FD.events.size() > 0
+    int mOpen  = etm
+    int mClose = etm + int(math.ceil(tfSec / 60.0))
+    for [i, e] in FD.events
+        int md = FD.eventDays.get(i)
+        bool dayOk = md == 0 ? lastDay : md == barMd
+        if dayOk and mOpen <= e + evAfter and mClose >= e - evBefore
+            inEvent := true
+
+// ───────────────────────────── signals
+var int sigState   = 0
+var int lastSigBar = -100000
+bool barOk = confirmIn ? barstate.isconfirmed : true
+if sigState == 1 and scoreS < thrIn * 0.3
+    sigState := 0
+if sigState == -1 and scoreS > -thrIn * 0.3
+    sigState := 0
+bool gate    = bar_index - lastSigBar >= coolIn and agree >= agreeIn and not inEvent and barOk
+bool buySig  = gate and scoreS >= thrIn and sigState != 1
+bool sellSig = gate and scoreS <= -thrIn and sigState != -1
+if buySig
+    sigState   := 1
+    lastSigBar := bar_index
+if sellSig
+    sigState   := -1
+    lastSigBar := bar_index
+bool strongSig = math.abs(scoreS) >= strongIn
+
+string regimeTxt = gamma > 0.2 ? "Positive γ · fade moves" : gamma < -0.2 ? "Negative γ · follow moves" : "Neutral γ"
+string regimeSrc = not na(gLvl) ? "pasted levels" : na(gTs) ? "proxy: variance ratio" : "proxy: variance ratio + VIX curve"
+
+// trade plan: ATR bracket, target capped at the gamma wall in the trade's direction
+float riskPts = stopAtr * atrS
+float costPts = costTk * syminfo.mintick
+float stopPx  = na
+float tgtPx   = na
+string tgtWhy = ""
+if buySig or sellSig
+    int d = buySig ? 1 : -1
+    stopPx := close - d * riskPts
+    tgtPx  := close + d * tgtAtr * atrS
+    tgtWhy := str.tostring(tgtAtr) + "×ATR"
+    if wallTgt and gexOn
+        float wall = d == 1 ? cwC : pwC
+        if not na(wall) and d * (wall - close) > 0.5 * riskPts and d * (wall - close) < d * (tgtPx - close)
+            tgtPx  := wall - d * 2 * syminfo.mintick
+            tgtWhy := d == 1 ? "call wall" : "put wall"
+
+// ───────────────────────────── self-test: grade every signal with its bracket
+type Trade
+    int   dir
+    int   barIdx
+    float entry
+    float stop
+    float tgt
+    float risk
+
+var array<Trade> openT = array.new<Trade>()
+var int   tN   = 0
+var int   tWin = 0
+var float tSum = 0.0
+var float tGW  = 0.0
+var float tGL  = 0.0
+if barstate.isconfirmed and openT.size() > 0
+    for i = openT.size() - 1 to 0
+        Trade t = openT.get(i)
+        if bar_index > t.barIdx
+            float r = na
+            if t.dir == 1
+                if low <= t.stop
+                    r := (math.min(open, t.stop) - t.entry) / t.risk
+                else if high >= t.tgt
+                    r := (t.tgt - t.entry) / t.risk
+            else
+                if high >= t.stop
+                    r := (t.entry - math.max(open, t.stop)) / t.risk
+                else if low <= t.tgt
+                    r := (t.entry - t.tgt) / t.risk
+            if na(r) and bar_index - t.barIdx >= maxHold
+                r := t.dir * (close - t.entry) / t.risk
+            if not na(r)
+                r -= costPts / t.risk
+                tN   += 1
+                tSum += r
+                if r > 0
+                    tWin += 1
+                    tGW  += r
+                else
+                    tGL  -= r
+                openT.remove(i)
+if buySig or sellSig
+    openT.push(Trade.new(buySig ? 1 : -1, bar_index, close, stopPx, tgtPx, riskPts))
+
+// edge check: does the score predict the next `horizon` bars on this chart?
+float icScore = ta.correlation(scoreS[horizon], fwdRet, icLen)
+float icT     = nz(icScore) * math.sqrt(float(icLen) / horizon)
+
+// ───────────────────────────── pane plots
+color colScore = scoreS >= 0 ? color.from_gradient(scoreS, 0, strongIn, color.new(cBuy, 75), cBuy) : color.from_gradient(scoreS, -strongIn, 0, cSell, color.new(cSell, 75))
+hline(0, "Zero", color.new(color.gray, 50))
+hline(thrIn, "Buy threshold", color.new(cBuy, 40), hline.style_dashed)
+hline(-thrIn, "Sell threshold", color.new(cSell, 40), hline.style_dashed)
+hline(strongIn, "Strong buy", color.new(cBuy, 70), hline.style_dotted)
+hline(-strongIn, "Strong sell", color.new(cSell, 70), hline.style_dotted)
+plot(scoreS, "Score", colScore, style = plot.style_columns)
+plot(nz(cFlow) * 100, "Order-flow imbalance", color.new(#2962FF, 10), 1)
+bgcolor(gamma > 0.2 ? color.new(color.teal, 92) : gamma < -0.2 ? color.new(color.red, 92) : na, title = "Gamma regime")
+bgcolor(inEvent ? color.new(color.yellow, 80) : na, title = "News event pause")
+plot(nz(cFlow) * 100, "· flow", display = display.data_window)
+plot(nz(cExh) * 100, "· absorption/divergence", display = display.data_window)
+plot(cTrend * 100, "· Kalman trend", display = display.data_window)
+plot(cVwap * 100, "· VWAP", display = display.data_window)
+plot(nz(cWall) * 100, "· gamma walls", display = display.data_window)
+plot(gamma * 100, "· gamma regime", display = display.data_window)
+plot(agree * 100, "· agreement %", display = display.data_window)
+plot(delta, "· volume delta", display = display.data_window)
+plot(sCvd, "· session CVD", display = display.data_window)
+
+// ───────────────────────────── price-chart drawings
+plot(showVwap and not newSess ? vwap_ : na, "VWAP", color.new(#FF9800, 0), 2, plot.style_linebr, force_overlay = true)
+plot(showVwap and not newSess ? vwap_ + vSd : na, "VWAP +1σ", color.new(#FF9800, 60), 1, plot.style_linebr, force_overlay = true)
+plot(showVwap and not newSess ? vwap_ - vSd : na, "VWAP -1σ", color.new(#FF9800, 60), 1, plot.style_linebr, force_overlay = true)
+plot(showVwap and not newSess ? vwap_ + 2 * vSd : na, "VWAP +2σ", color.new(#FF9800, 80), 1, plot.style_linebr, force_overlay = true)
+plot(showVwap and not newSess ? vwap_ - 2 * vSd : na, "VWAP -2σ", color.new(#FF9800, 80), 1, plot.style_linebr, force_overlay = true)
+plot(showPoc and not newSess ? poc : na, "POC", color.new(#00BCD4, 20), 1, plot.style_stepline, force_overlay = true)
+plotchar(shock, "News shock", "⚡", location.abovebar, color.new(#FFD600, 0), size = size.tiny, force_overlay = true)
+barcolor(barCol ? colScore : na)
+
+if showSigs and (buySig or sellSig)
+    string flowTxt = hasVol ? signed(imb * 100, "#") + "% net " + (imb >= 0 ? "buying" : "selling") : "no volume data"
+    string tip = "Score " + signed(scoreS, "#") + " · agreement " + str.tostring(agree * 100, "#") + "%" +
+         "\nGamma: " + regimeTxt + " (" + regimeSrc + ")" +
+         "\nOrder flow: " + flowTxt +
+         "\nTrend: " + signed(cTrend * 100, "#") + " · VWAP " + signed(vz, "#.#") + "σ" +
+         "\nStop " + px(stopPx) + " · Target " + px(tgtPx) + " (" + tgtWhy + ")"
+    label.new(bar_index, buySig ? low : high, (buySig ? "BUY" : "SELL") + (strongSig ? "+" : ""),
+         yloc = buySig ? yloc.belowbar : yloc.abovebar, style = buySig ? label.style_label_up : label.style_label_down,
+         color = buySig ? cBuy : cSell, textcolor = color.white, size = size.small, tooltip = tip, force_overlay = true)
+
+var line planStop = na
+var line planTgt  = na
+if showPlan and (buySig or sellSig)
+    if not na(planStop)
+        planStop.delete()
+    if not na(planTgt)
+        planTgt.delete()
+    planStop := line.new(bar_index, stopPx, bar_index + maxHold, stopPx, color = cSell, style = line.style_dashed, width = 1, force_overlay = true)
+    planTgt  := line.new(bar_index, tgtPx, bar_index + maxHold, tgtPx, color = cBuy, style = line.style_dashed, width = 1, force_overlay = true)
+
+// gamma levels, drawn from the start of the live window
+var array<line>  lvlLines  = array.new<line>()
+var array<label> lvlLabels = array.new<label>()
+var int liveStart = na
+if liveWin and na(liveStart)
+    liveStart := bar_index
+
+drawLevel(float y, string name, color col, string st, int w) =>
+    int x0 = math.max(nz(liveStart, bar_index - 100), bar_index - 5000)
+    lvlLines.push(line.new(x0, y, bar_index + 10, y, color = col, style = st, width = w, force_overlay = true))
+    lvlLabels.push(label.new(bar_index + 10, y, name + "  " + str.tostring(y, format.mintick), style = label.style_label_left,
+         color = color.new(col, 80), textcolor = col, size = size.small, force_overlay = true))
+
+if barstate.islast and showLvls
+    for l in lvlLines
+        l.delete()
+    for l in lvlLabels
+        l.delete()
+    lvlLines.clear()
+    lvlLabels.clear()
+    if gexOn
+        if not na(flipC)
+            drawLevel(flipC, "Gamma flip", color.new(#FFD600, 0), line.style_solid, 2)
+        if not na(cwC)
+            drawLevel(cwC, "Call wall", color.new(cBuy, 0), line.style_solid, 2)
+        if not na(pwC)
+            drawLevel(pwC, "Put wall", color.new(cSell, 0), line.style_solid, 2)
+        for x in FD.extra
+            drawLevel(x * conv, "γ level", color.new(color.gray, 20), line.style_dashed, 1)
+
+// ───────────────────────────── dashboard
+string tablePosition = tblPos == "Top right" ? position.top_right : tblPos == "Bottom right" ? position.bottom_right : tblPos == "Top left" ? position.top_left : position.bottom_left
+var table tb = table.new(tablePosition, 2, 17, bgcolor = color.new(#131722, 8), frame_color = color.new(color.gray, 50), frame_width = 1, border_color = color.new(color.gray, 75), border_width = 1, force_overlay = true)
+
+row(int r, string k, string v, color vc, string tip) =>
+    table.cell(tb, 0, r, k, text_color = color.new(color.white, 35), text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, r, v, text_color = vc, text_size = size.small, text_halign = text.align_left, tooltip = tip)
+
+if showTbl and barstate.islast
+    color white = color.new(color.white, 5)
+    color muted = color.new(color.white, 45)
+    string verdict = inEvent ? "WAIT · news event" : scoreS >= strongIn ? "STRONG BUY" : scoreS >= thrIn ? "BUY" : scoreS >= thrIn * 0.5 ? "LEAN BUY" : scoreS <= -strongIn ? "STRONG SELL" : scoreS <= -thrIn ? "SELL" : scoreS <= -thrIn * 0.5 ? "LEAN SELL" : "WAIT · no edge"
+    color vCol = inEvent ? color.new(#FFD600, 0) : scoreS >= thrIn * 0.5 ? cBuy : scoreS <= -thrIn * 0.5 ? cSell : muted
+    table.cell(tb, 0, 0, "GAMMA + ORDER FLOW", text_color = white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, 0, verdict + "  " + signed(scoreS, "#"), text_color = vCol, text_size = size.normal, text_halign = text.align_left,
+         tooltip = "Score -100…+100. BUY above " + str.tostring(thrIn) + ", SELL below -" + str.tostring(thrIn) + ".")
+    row(1, "Agreement", str.tostring(agree * 100, "#") + "%", agree >= agreeIn ? white : muted, "Share of weighted evidence that agrees with the score's direction.")
+    row(2, "Gamma regime", regimeTxt, gamma > 0.2 ? color.new(color.teal, 0) : gamma < -0.2 ? cSell : muted,
+         "Source: " + regimeSrc + "\nVariance ratio " + str.tostring(vr, "#.##") + (na(ts) ? "" : " · VIX/VIX3M " + str.tostring(ts, "#.##")))
+    row(3, "Gamma flip", gexOn and not na(flipC) ? px(flipC) + "  (" + signed(close - flipC, "#") + ")" : "— paste feed", white, "Above the flip dealers are long gamma (calmer, mean-reverting). Below it they are short gamma (faster, trending).")
+    row(4, "Call wall", gexOn and not na(cwC) ? px(cwC) + "  (" + signed(cwC - close, "#") + ")" : "—", cBuy, "Largest call gamma strike: usually resistance / a magnet in positive gamma.")
+    row(5, "Put wall", gexOn and not na(pwC) ? px(pwC) + "  (" + signed(pwC - close, "#") + ")" : "—", cSell, "Largest put gamma strike: usually support. A break below it in negative gamma can accelerate.")
+    row(6, "Order flow", hasVol ? signed(imb * 100, "#") + "% net " + (imb >= 0 ? "buying" : "selling") + " · " + str.tostring(ofLen) + " bars" : "no volume on this symbol", imb >= 0 ? cBuy : cSell,
+         "Volume delta from " + (ibN > 0 ? ltf + " intrabars" : "bar estimate") + ". Component " + signed(nz(cFlow) * 100, "#"))
+    row(7, "Session CVD", hasVol ? signed(sCvd, format.volume) : "—", sCvd >= 0 ? cBuy : cSell, "Cumulative volume delta since the VWAP reset.")
+    string exhTxt = bullDiv ? "bullish CVD divergence" : bearDiv ? "bearish CVD divergence" : absorbed ? (delta < 0 ? "sellers absorbed" : "buyers absorbed") : math.abs(nz(cExh)) > 0.2 ? (cExh > 0 ? "recent bullish absorption" : "recent bearish absorption") : "none"
+    row(8, "Absorption", exhTxt, nz(cExh) > 0.2 ? cBuy : nz(cExh) < -0.2 ? cSell : muted, "Big delta that fails to move price, or a new high / low the CVD does not confirm.")
+    row(9, "Kalman trend", signed(kv / atrS, "#.###") + " ATR/bar", cTrend >= 0 ? cBuy : cSell, "Velocity of a 2-state Kalman filter on price. Component " + signed(cTrend * 100, "#"))
+    row(10, "VWAP", signed(vz, "#.#") + "σ · POC " + px(poc), vz >= 0 ? cBuy : cSell, "Distance from session VWAP in volume-weighted standard deviations.")
+    string nextEvt = ""
+    int nowMin = etm
+    int best = 100000
+    for [i, e] in FD.events
+        int md = FD.eventDays.get(i)
+        if (md == 0 or md == barMd) and e + evAfter >= nowMin and e < best
+            best := e
+    if best < 100000
+        nextEvt := " · next event " + pad2(int(math.floor(best / 60))) + ":" + pad2(best % 60) + " ET"
+    string newsTxt = (newsOn ? "mood " + signed(FD.news, "#.##") + " (" + signed(newsTilt, "#") + " pts)" : "no mood pasted") + nextEvt
+    row(11, "News", newsTxt, inEvent ? color.new(#FFD600, 0) : FD.news > 0 ? cBuy : FD.news < 0 ? cSell : muted, "From the quant.bot feed: impact-weighted headline mood and scheduled high-impact US releases.")
+    string trTxt = tN > 0 ? str.tostring(tN) + " trades · " + str.tostring(100.0 * tWin / tN, "#") + "% win · " + signed(tSum / tN, "#.##") + "R" + (tGL > 0 ? " · PF " + str.tostring(tGW / tGL, "#.##") : "") : "no closed signals yet"
+    row(12, "Self-test", trTxt, tN > 0 and tSum > 0 ? cBuy : tN > 0 ? cSell : muted,
+         "Every signal on this chart, traded with its stop / target / time exit, after " + str.tostring(costTk) + " ticks cost. Past results on one chart are not a guarantee.")
+    string icTxt = na(icScore) ? "needs " + str.tostring(icLen + horizon) + " bars" : "IC " + signed(icScore, "#.###") + " · t " + str.tostring(icT, "#.#") + (icT >= 2 ? " · edge" : icT > 0 ? " · unproven" : " · no edge here")
+    row(13, "Edge check", icTxt, icT >= 2 ? cBuy : icT > 0 ? muted : cSell,
+         "Correlation between the score and the next " + str.tostring(horizon) + " bars' move over the last " + str.tostring(icLen) + " bars. t ≥ 2 suggests a real edge; below that, treat signals as noise.")
+    row(14, "Data", (ibN > 0 ? "intrabar delta · " + ltf : hasVol ? "bar-estimate delta" : "no volume") + (adaptIn ? " · adaptive" : ""), muted, "")
+
+// ───────────────────────────── alerts
+alertcondition(buySig, "GOF BUY", "GOF BUY {{ticker}} {{interval}} at {{close}}")
+alertcondition(sellSig, "GOF SELL", "GOF SELL {{ticker}} {{interval}} at {{close}}")
+if buySig or sellSig
+    alert((buySig ? "BUY " : "SELL ") + syminfo.ticker + " score " + signed(scoreS, "#") + " | stop " + px(stopPx) + " | target " + px(tgtPx) + " (" + tgtWhy + ") | " + regimeTxt, alert.freq_once_per_bar_close)

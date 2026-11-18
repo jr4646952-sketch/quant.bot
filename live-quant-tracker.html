@@ -55,6 +55,9 @@ button{padding:10px 14px;border-radius:10px;border:0;background:var(--accent);co
 svg{display:block;width:100%;height:90px}
 .reason{display:flex;justify-content:space-between;font-size:13px;padding:3px 0}
 .hidden{display:none}
+.lv{display:flex;justify-content:space-between;font-size:14px;padding:4px 0;border-bottom:1px solid var(--line)}
+.lv:last-child{border-bottom:0}
+.feed{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
 </style>
 </head>
 <body>
@@ -78,6 +81,18 @@ svg{display:block;width:100%;height:90px}
     <div class="row small muted"><span>0% (down)</span><span>50% = coin flip</span><span>100% (up)</span></div>
     <p class="small" style="margin:10px 0 4px">With news: <b id="pNews" class="num">—</b> <span class="muted">(news mood <span id="newsScore">—</span>, graded live below)</span></p>
     <div id="reasons" style="margin-top:8px"></div>
+  </section>
+
+  <section class="card" id="gammaCard">
+    <h2>Dealer gamma + TradingView feed</h2>
+    <div class="row"><div><span id="gRegime" class="pill muted">—</span></div><div class="small muted num" id="gNet">—</div></div>
+    <p class="small" id="gExplain" style="margin:8px 0"></p>
+    <div id="gLevels"></div>
+    <div id="gEvents" style="margin-top:10px"></div>
+    <p class="small" style="margin:12px 0 4px"><b>Paste into the TradingView indicator</b> (Settings → quant.bot feed):</p>
+    <input id="tvFeed" class="feed" readonly value="">
+    <div class="flex"><button id="tvCopy">Copy feed</button></div>
+    <p class="note" id="gInfo"></p>
   </section>
 
   <section class="card">
@@ -243,8 +258,48 @@ function render(s) {
     return `<li>${tag}<a href="${esc(link)}" target="_blank" rel="noopener">${esc(h.title)}</a><div class="note">${esc(h.source || '')} · ${tm(h.t)}</div></li>`;
   }).join('') || '<li class="muted">no headlines</li>';
 
+  renderGamma(s);
   $('updated').textContent = `Bot last ran ${tm(s.updated)} · run #${s.runs} · page refreshes every minute.`;
 }
+
+function renderGamma(s) {
+  const g = s.gamma || {}, price = (s.market || {}).price, cal = (s.calendar || {}).events || [];
+  const ok = g.call_wall != null;
+  const reg = $('gRegime');
+  reg.textContent = ok ? (g.regime === 'positive' ? 'Positive gamma' : 'Negative gamma') : (g.error ? 'gamma unavailable' : 'waiting for first run');
+  reg.className = 'pill ' + (!ok ? 'warn' : g.regime === 'positive' ? 'up' : 'down');
+  $('gNet').textContent = ok ? `net GEX ${g.net_gex_bn > 0 ? '+' : ''}$${g.net_gex_bn.toFixed(2)}bn per 1% move` : '';
+  $('gExplain').textContent = !ok ? '' : g.regime === 'positive'
+    ? 'Dealers are long gamma: they sell rallies and buy dips, so moves tend to fade back toward VWAP. Favour fading stretches near the walls.'
+    : 'Dealers are short gamma: they sell into drops and buy into rallies, so moves tend to run. Favour following order flow; a break of the put wall can accelerate.';
+  const dist = v => price == null || v == null ? '' : `<span class="muted">${v - price > 0 ? '+' : ''}${Math.round(v - price)} pts</span>`;
+  const ladder = [['Call wall (resistance)', g.call_wall, 'up'], ['Gamma flip', g.flip, 'warn'], ['Put wall (support)', g.put_wall, 'down'],
+    ...(g.levels || []).map(v => ['Key gamma level', v, 'muted'])].filter(r => r[1] != null);
+  if (price != null) ladder.push(['▶ Price now', price, '']);
+  ladder.sort((a, b) => b[1] - a[1]);
+  $('gLevels').innerHTML = !ok ? '' : ladder.map(([name, v, c]) => name.startsWith('▶')
+    ? `<div class="lv"><b>${name}</b><b class="num">${Number(v).toLocaleString()}</b></div>`
+    : `<div class="lv"><span class="${c}">${name}</span><span class="num">${Number(v).toLocaleString()} ${dist(v)}</span></div>`).join('') +
+    (g.flip == null && g.flip_note ? `<p class="note">${esc(g.flip_note)}</p>` : '');
+  const now = Date.now() / 1000;
+  const soon = cal.filter(e => e.impact >= 3 && e.t >= now - 3600 && e.t <= now + 36 * 3600);
+  $('gEvents').innerHTML = soon.length
+    ? '<div class="small muted" style="margin-bottom:4px">High-impact US releases (signals pause around these)</div>' + soon.map(e =>
+      `<div class="lv"><span>${esc(e.title)}</span><span class="small muted">${tm(e.t)}${e.forecast ? ' · f ' + esc(e.forecast) : ''}</span></div>`).join('')
+    : (s.calendar && !s.calendar.error ? '<div class="small muted">No high-impact US releases in the next 36 h.</div>' : '');
+  $('tvFeed').value = (s.tradingview || {}).feed || '';
+  const src = Object.entries(g.sources || {}).map(([k, v]) => `${k} ${v.options} options`).join(' + ');
+  const age = g.t ? Math.round((now - g.t) / 60) : null;
+  $('gInfo').textContent = (ok ? `Levels from ${src} open interest, ${age} min old, mapped to ${(s.config || {}).symbol || 'the chart'}. ` : '') +
+    (g.error ? `Last update failed: ${g.error}. ` : '') +
+    'Open interest changes once a day, so paste a fresh feed each morning. This models dealer positioning; it is not their real book.';
+}
+
+$('tvCopy').onclick = async () => {
+  const el = $('tvFeed');
+  try { await navigator.clipboard.writeText(el.value); } catch (e) { el.select(); try { document.execCommand('copy'); } catch (_) {} }
+  $('tvCopy').textContent = 'Copied'; setTimeout(() => { $('tvCopy').textContent = 'Copy feed'; }, 1500);
+};
 
 function drawCurve(pts) {
   const svg = $('curve');

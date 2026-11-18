@@ -10,7 +10,9 @@ What it does on every run:
      impact. The news mood gives a separate "news-adjusted" probability, which is logged
      and graded live so you can see whether the news actually helps.
   5. Paper trades 1 contract with a stop loss, take profit and time limit, after costs.
-  6. Saves everything to a JSON file that the tracker page shows.
+  6. Every 30 min works out dealer gamma levels (bot/gamma.py) and every hour reads the economic
+     calendar, then writes a one-line "TradingView feed" for tradingview/gamma_orderflow_signal.pine.
+  7. Saves everything to a JSON file that the tracker page shows.
 
 Paper money only - this never connects to a broker. Not financial advice.
 
@@ -26,6 +28,7 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gamma  # noqa: E402
 import news  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -75,6 +78,10 @@ def config():
         "retrain_bars": int(e("RETRAIN_BARS", "100")),
         "require_edge": e("REQUIRE_EDGE", "1") != "0",
         "news_tilt": float(e("NEWS_TILT", "0.02")),
+        "gamma": e("GAMMA", "1") != "0",
+        "gamma_sources": e("GAMMA_SOURCES", "QQQ,_NDX"),
+        "gamma_every_min": int(e("GAMMA_EVERY_MIN", "30")),
+        "calendar_every_min": int(e("CALENDAR_EVERY_MIN", "60")),
     }
 
 
@@ -113,6 +120,57 @@ def fetch_bars(symbol, tf):
 def fetch_news():
     """Scored NASDAQ headlines (see bot/news.py). The bot keeps the top 40 for the dashboard."""
     return news.fetch_news(max_age_h=6, limit=40)
+
+
+def fetch_gamma(price, sources, now):
+    """Dealer gamma levels mapped onto the traded symbol's price (see bot/gamma.py)."""
+    return gamma.compute(target_price=price, sources=[x.strip() for x in sources.split(",") if x.strip()], now=now)
+
+
+def fetch_calendar():
+    return news.fetch_calendar()
+
+
+def et_stamp(t):
+    """MMDD@HHMM in New York time, the event format the TradingView indicator reads."""
+    lt = time.gmtime(t + gamma.et_offset_hours(t) * 3600)
+    return f"{lt.tm_mon:02d}{lt.tm_mday:02d}@{lt.tm_hour:02d}{lt.tm_min:02d}"
+
+
+def update_context(state, cfg, now, price, gamma_fn=fetch_gamma, calendar_fn=fetch_calendar):
+    """Refresh gamma levels and the economic calendar on their own (slower) schedules."""
+    if cfg["gamma"] and now - state.get("gamma_try", 0) >= cfg["gamma_every_min"] * 60:
+        state["gamma_try"] = int(now)
+        try:
+            state["gamma"] = gamma_fn(price, cfg["gamma_sources"], now)
+        except Exception as e:
+            g = state.get("gamma") or {}
+            g["error"] = f"{e.__class__.__name__}: {e}"[:200]
+            state["gamma"] = g
+    if now - state.get("calendar_try", 0) >= cfg["calendar_every_min"] * 60:
+        state["calendar_try"] = int(now)
+        try:
+            state["calendar"] = calendar_fn()
+        except Exception as e:
+            c = state.get("calendar") or {}
+            c["error"] = f"{e.__class__.__name__}: {e}"[:200]
+            state["calendar"] = c
+
+
+def tradingview_feed(state, now):
+    """One line to paste into the TradingView indicator: G=flip,call wall,put wall,levels;N=mood;E=events."""
+    parts = []
+    g = state.get("gamma") or {}
+    if g.get("call_wall") and now - g.get("t", 0) < 36 * 3600:
+        parts.append(gamma.tv_levels(g))
+    ns = (state.get("news") or {}).get("score")
+    if ns is not None:
+        parts.append(f"N={ns:.2f}")
+    evs = [e for e in (state.get("calendar") or {}).get("events", [])
+           if e.get("impact", 0) >= 3 and now - 3600 <= e["t"] <= now + 36 * 3600]
+    if evs:
+        parts.append("E=" + ",".join(dict.fromkeys(et_stamp(e["t"]) for e in evs)))
+    return ";".join(parts)
 
 
 # ----------------------------------------------------------------------------- math
@@ -435,7 +493,8 @@ def save_state(path, state):
     os.replace(tmp, path)
 
 
-def run_once(cfg, path, now=None, bars_fn=fetch_bars, news_fn=fetch_news):
+def run_once(cfg, path, now=None, bars_fn=fetch_bars, news_fn=fetch_news, gamma_fn=fetch_gamma,
+             calendar_fn=fetch_calendar):
     now = now or time.time()
     state = load_state(path)
     if state and any(state.get("config", {}).get(k) != cfg[k] for k in ("symbol", "timeframe")):
@@ -469,6 +528,8 @@ def run_once(cfg, path, now=None, bars_fn=fetch_bars, news_fn=fetch_news):
     ind = indicators(bars)
     book = Book(state, cfg)
     last = len(bars) - 1
+    update_context(state, cfg, now, bars[last]["c"], gamma_fn, calendar_fn)
+    state["tradingview"] = {"feed": tradingview_feed(state, now), "t": int(now)}
 
     def retrain(end):
         model, report = train(bars, ind, end, cfg)
@@ -553,6 +614,15 @@ def main():
     if lt:
         print(f"  P(up next bar) = {lt['p_up']:.1%}  news-adjusted = {lt['p_news']:.1%}  -> {lt['signal']}")
     print(f"  equity = ${s.get('equity_now', s.get('cash'))}")
+    g = s.get("gamma") or {}
+    if g.get("call_wall"):
+        print(f"  gamma: {g['regime']} (${g['net_gex_bn']:+.2f}bn/1%)  flip {g.get('flip')}  "
+              f"call wall {g['call_wall']}  put wall {g['put_wall']}")
+    if g.get("error"):
+        print(f"  gamma error: {g['error']}")
+    tv = (s.get("tradingview") or {}).get("feed")
+    if tv:
+        print(f"  TradingView feed: {tv}")
 
 
 if __name__ == "__main__":

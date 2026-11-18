@@ -40,6 +40,9 @@ Edit `.github/workflows/paper-bot.yml` in the repo (under `env:`):
 | `COMMISSION` / `SLIPPAGE_TICKS` | `1.00` / `1` | cost per side |
 | `REQUIRE_EDGE` | `1` | `0` lets it trade even when the honest test failed (not recommended) |
 | `NEWS_TILT` | `0.02` | how far the news mood can move the news-adjusted probability |
+| `GAMMA` | `1` | `0` turns off the dealer gamma levels |
+| `GAMMA_SOURCES` | `QQQ,_NDX` | CBOE option chains combined for the gamma levels |
+| `GAMMA_EVERY_MIN` / `CALENDAR_EVERY_MIN` | `30` / `60` | how often gamma levels and the economic calendar refresh |
 
 To restart from scratch, delete `state/bot.json` in the repo.
 
@@ -50,6 +53,10 @@ To restart from scratch, delete `state/bot.json` in the repo.
 - **Timing:** GitHub schedules can run a few minutes late. The bot only acts on *closed* bars
   and replays every bar it missed, so stop losses and take profits are still checked against each bar's high/low.
 - **Re-optimizes itself** every 100 bars using a 70% train / 30% unseen-test split, and logs the honest test result.
-- **News:** each run saves the latest NASDAQ headlines (Yahoo Finance, CNBC, MarketWatch, Nasdaq.com) with a bullish/bearish tag.
+- **News:** each run saves the latest NASDAQ headlines (Yahoo Finance, CNBC, MarketWatch, WSJ, Nasdaq.com, Fed, BLS, BEA) with a bullish/bearish tag.
+- **Gamma + TradingView:** every 30 minutes the bot computes dealer gamma levels from CBOE's free (15-minute delayed)
+  QQQ and NDX option chains, and every hour it reads this week's US economic calendar. The dashboard's
+  **Dealer gamma + TradingView feed** card has a *Copy feed* button for the TradingView indicator
+  ([tradingview/README.md](tradingview/README.md)). You can also run `python bot/gamma.py` on your PC.
 - GitHub pauses scheduled workflows in repos with no activity for 60 days — the bot's own commits count as activity.
 - This is a test tool, not financial advice. Futures are leveraged: 1 MNQ point = $2, and a normal day can move 300+ points.
